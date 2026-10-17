@@ -30,7 +30,7 @@ use self::cache::{
     FlightRole, Stored, TokenCache, BREAKER_THRESHOLD,
 };
 use self::nova::{exact_name_match, query_servers, select_address, NovaError, NovaServer};
-use crate::config::OpenStackConfig;
+use crate::config::{Config, OpenStackConfig};
 
 /// HTTP client shared by all discovery calls (pooled connections).
 #[derive(Clone)]
@@ -402,6 +402,25 @@ impl Resolver for OpenStackResolver {
     async fn resolve(&self, instance: &str) -> Result<ResolvedInstance, ResolveError> {
         OpenStackResolver::resolve(self, instance).await
     }
+}
+
+/// Build one [`Resolver`] per openstack site, keyed by site name (P7).
+///
+/// All resolvers share a single [`HttpClient`] so Keystone/Nova connections are
+/// pooled across every site. The returned map is the value stored in
+/// [`crate::state::SharedState::resolvers`] and indexed by the routing layer's
+/// `site_idx` → site name.
+pub fn build_resolvers(config: &Config) -> HashMap<String, Arc<dyn Resolver>> {
+    let client = Arc::new(HttpClient::new());
+    config
+        .openstack
+        .iter()
+        .map(|site| {
+            let resolver: Arc<dyn Resolver> =
+                Arc::new(OpenStackResolver::new(&site.openstack, Arc::clone(&client)));
+            (site.name.clone(), resolver)
+        })
+        .collect()
 }
 
 #[cfg(test)]

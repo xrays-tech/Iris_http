@@ -1,0 +1,14 @@
+{
+  "servers": [
+    {
+      "id": "33333333-3333-3333-3333-333333333333",
+      "name": "failover",
+      "addresses": {
+        "net-a": [
+          { "version": 4, "addr": "127.0.0.2", "OS-EXT-IPS:type": "floating" },
+          { "version": 4, "addr": "127.0.0.1", "OS-EXT-IPS:type": "fixed" }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+# `noip` has a valid role and a Nova fixture with no addresses: 502.
+allowed_ports:
+  - 18101

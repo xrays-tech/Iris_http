@@ -1,0 +1,4 @@
+# `missinginst` has a valid role but no Nova fixture: the ACL passes and the
+# discovery layer answers 404 (instance not found).
+allowed_ports:
+  - 18101

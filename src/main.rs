@@ -23,7 +23,6 @@ use iris_http::config::load_config;
 use iris_http::lb::health_check_service;
 use iris_http::logging;
 use iris_http::proxy::IrisProxy;
-use iris_http::routing::RoutingTable;
 use iris_http::state::SharedState;
 use iris_http::tls::SniCertSource;
 use iris_http::{reload, Cli, Command, RunArgs};
@@ -116,17 +115,18 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let config = load_config(&sites_dir, &env)
         .map_err(|err| anyhow::anyhow!("failed to load configuration: {err}"))?;
 
-    // Compile the routing table and per-site load balancers into the shared
-    // snapshots read on the request path.
-    let routing = RoutingTable::try_from(&config)
-        .map_err(|err| anyhow::anyhow!("failed to build routing table: {err}"))?;
-
     // Build the per-SNI certificate source before `config` is moved into the
     // shared state. A missing/unparseable certificate is a startup failure.
     let cert_source = SniCertSource::from_sites(&config)
         .map_err(|err| anyhow::anyhow!("failed to build TLS certificate map: {err:#}"))?;
 
-    let shared = Arc::new(SharedState::new(config, routing));
+    // Compile the routing table, per-site load balancers, firewall tables and
+    // instance resolvers into the shared snapshots read on the request path.
+    // A bad `.role` file fails startup here with context (`firewall.md` §2).
+    let shared = Arc::new(
+        SharedState::try_new(config)
+            .map_err(|err| anyhow::anyhow!("failed to build shared state: {err}"))?,
+    );
 
     if let Some(pidfile) = &args.pidfile {
         write_pidfile(pidfile)?;
@@ -134,11 +134,16 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let listen_addr = http_listen_addr();
     let tls_addr = tls_listen_addr();
+    let openstack_sites = shared.config.load().openstack.len();
+    let resolvers = shared.resolvers.load().len();
+    let firewalled_sites = shared.firewall.load().len();
     tracing::info!(
         config_dir = %args.config_dir.display(),
         sites_dir = %sites_dir.display(),
         forward_sites = shared.config.load().forward.len(),
-        openstack_sites = shared.config.load().openstack.len(),
+        openstack_sites,
+        resolvers,
+        firewalled_sites,
         watch_config = args.watch_config,
         version = env!("CARGO_PKG_VERSION"),
         "starting iris"
@@ -229,8 +234,7 @@ mod probe_tests {
             forward: Vec::new(),
             openstack: Vec::new(),
         };
-        let routing = RoutingTable::try_from(&config).expect("empty routing table builds");
-        Arc::new(SharedState::new(config, routing))
+        Arc::new(SharedState::try_new(config).expect("empty shared state builds"))
     }
 
     struct NoopBackground;

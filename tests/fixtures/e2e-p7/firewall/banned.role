@@ -1,0 +1,6 @@
+# Blacklist that contains the test client (127.0.0.1): every request from the
+# loopback client is denied with 403 (Blacklisted), which outranks the ACL.
+allowed_ports:
+  - 18101
+blacklist:
+  - 127.0.0.0/8

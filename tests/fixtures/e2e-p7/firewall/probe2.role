@@ -1,0 +1,3 @@
+# `probe2` mirrors `probe` for the second forced-failure case.
+allowed_ports:
+  - 18101

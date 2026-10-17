@@ -1,0 +1,3 @@
+# OpenStack firewall role: `fixedonly` accepts the upstream stub's target port.
+allowed_ports:
+  - 18101

@@ -1,0 +1,14 @@
+{
+  "servers": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "name": "web",
+      "addresses": {
+        "net-a": [
+          { "version": 4, "addr": "127.0.0.1", "OS-EXT-IPS:type": "floating" },
+          { "version": 4, "addr": "127.0.0.1", "OS-EXT-IPS:type": "fixed" }
+        ]
+      }
+    }
+  ]
+}

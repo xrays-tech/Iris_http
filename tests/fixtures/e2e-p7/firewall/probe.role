@@ -1,0 +1,4 @@
+# `probe` / `probe2` are used for the forced control-plane failure cases (500 /
+# 403): they have valid roles so the ACL passes and discovery is reached.
+allowed_ports:
+  - 18101

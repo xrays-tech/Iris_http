@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "id": "22222222-2222-2222-2222-222222222222",
+      "name": "fixedonly",
+      "addresses": {
+        "net-a": [
+          { "version": 4, "addr": "127.0.0.1", "OS-EXT-IPS:type": "fixed" }
+        ]
+      }
+    }
+  ]
+}
