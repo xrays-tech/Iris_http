@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use pingora::listeners::tls::TlsSettings;
 use pingora::proxy::http_proxy_service;
 use pingora::server::configuration::{Opt, ServerConf};
 use pingora::server::Server;
@@ -24,6 +25,7 @@ use iris_http::logging;
 use iris_http::proxy::IrisProxy;
 use iris_http::routing::RoutingTable;
 use iris_http::state::SharedState;
+use iris_http::tls::SniCertSource;
 use iris_http::{reload, Cli, Command, RunArgs};
 
 /// Default address of the shared HTTP listener (design.md §4.1 / D1).
@@ -33,6 +35,13 @@ const HTTP_LISTEN_ADDR: &str = "0.0.0.0:80";
 /// The production default is fixed at `0.0.0.0:80`; `config.md` §2 keeps the
 /// port out of the site files, so tests pick an ephemeral port here instead.
 const HTTP_LISTEN_ADDR_ENV: &str = "IRIS_HTTP_LISTEN_ADDR";
+/// Default address of the shared TLS (HTTPS) listener (design.md §4.1 / D1).
+const TLS_LISTEN_ADDR: &str = "0.0.0.0:443";
+/// Environment override for the TLS listener (test/runtime port selection).
+///
+/// Mirrors [`HTTP_LISTEN_ADDR_ENV`] so e2e tests can bind an unprivileged port
+/// without root rather than the production default `0.0.0.0:443`.
+const TLS_LISTEN_ADDR_ENV: &str = "IRIS_HTTP_LISTEN_TLS_ADDR";
 /// Time to let in-flight requests drain on graceful shutdown (design.md §4.1:
 /// `grace_period_seconds`; Pingora otherwise defaults to 5 minutes).
 const GRACE_PERIOD_SECONDS: u64 = 5;
@@ -72,6 +81,15 @@ fn http_listen_addr() -> String {
         .unwrap_or_else(|| HTTP_LISTEN_ADDR.to_owned())
 }
 
+/// Resolve the TLS listen address, honouring [`TLS_LISTEN_ADDR_ENV`].
+fn tls_listen_addr() -> String {
+    std::env::var(TLS_LISTEN_ADDR_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| TLS_LISTEN_ADDR.to_owned())
+}
+
 /// Start the proxy server. Diverges: `run_forever` only returns by exiting the
 /// process (graceful shutdown returns exit code 0 — see P0 smoke test).
 fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -102,6 +120,12 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     // snapshots read on the request path.
     let routing = RoutingTable::try_from(&config)
         .map_err(|err| anyhow::anyhow!("failed to build routing table: {err}"))?;
+
+    // Build the per-SNI certificate source before `config` is moved into the
+    // shared state. A missing/unparseable certificate is a startup failure.
+    let cert_source = SniCertSource::from_sites(&config)
+        .map_err(|err| anyhow::anyhow!("failed to build TLS certificate map: {err:#}"))?;
+
     let shared = Arc::new(SharedState::new(config, routing));
 
     if let Some(pidfile) = &args.pidfile {
@@ -109,6 +133,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let listen_addr = http_listen_addr();
+    let tls_addr = tls_listen_addr();
     tracing::info!(
         config_dir = %args.config_dir.display(),
         sites_dir = %sites_dir.display(),
@@ -127,6 +152,14 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     };
     let mut proxy_service = http_proxy_service(&server.configuration, app);
     proxy_service.add_tcp(&listen_addr);
+
+    // TLS termination: per-SNI certificate selection + H2/H1 ALPN on the same
+    // proxy service as the plain listener (design.md §4.1 / D1).
+    let mut tls_settings = TlsSettings::with_callbacks(Box::new(cert_source))
+        .map_err(|err| anyhow::anyhow!("failed to build TLS settings: {err}"))?;
+    tls_settings.enable_h2();
+    proxy_service.add_tls_with_settings(&tls_addr, None, tls_settings);
+
     server.add_service(proxy_service);
 
     register_health_checks(&mut server, &shared);
@@ -136,7 +169,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     // not bound here because P3 has no metrics to expose yet. Wiring lands with
     // the metrics in a later stage (P7/P8).
 
-    tracing::info!(http = %listen_addr, "iris forward lane ready; awaiting requests");
+    tracing::info!(http = %listen_addr, https = %tls_addr, "iris TLS lane ready; awaiting requests");
 
     // Never returns; graceful SIGTERM shutdown exits the process with code 0.
     server.run_forever()
@@ -232,6 +265,33 @@ mod probe_tests {
         assert!(metrics.app_logic().is_some());
     }
 
+    /// P4 TLS assembly probe: `SniCertSource::from_sites` -> `TlsSettings::with_callbacks`
+    /// -> `enable_h2()` -> `svc.add_tls_with_settings(addr, None, settings)` on the
+    /// same proxy service as `add_tcp`. Compile-checks the real wiring without
+    /// binding a socket (binding happens at `run_forever`).
+    #[test]
+    fn tls_service_assembly_compiles() {
+        let conf = Arc::new(ServerConf::new().expect("default ServerConf"));
+
+        let app = IrisProxy {
+            shared: test_shared(),
+        };
+        let mut proxy = http_proxy_service(&conf, app);
+        proxy.add_tcp("127.0.0.1:0");
+
+        let source = SniCertSource::from_sites(&Config {
+            forward: Vec::new(),
+            openstack: Vec::new(),
+        })
+        .expect("empty certificate map builds");
+        let mut tls_settings = TlsSettings::with_callbacks(Box::new(source))
+            .expect("TLS settings with callbacks build");
+        tls_settings.enable_h2();
+        proxy.add_tls_with_settings("127.0.0.1:0", None, tls_settings);
+
+        assert!(proxy.app_logic().is_some());
+    }
+
     /// Probe #4 / design.md §4.1: `ServerConf` carries the shutdown timing that
     /// P3 relies on for a prompt, graceful SIGTERM exit.
     #[test]
@@ -252,6 +312,13 @@ mod probe_tests {
     fn http_listen_addr_defaults_when_env_absent() {
         // `http_listen_addr` must never panic regardless of the ambient env.
         let addr = http_listen_addr();
+        assert!(!addr.trim().is_empty());
+    }
+
+    #[test]
+    fn tls_listen_addr_defaults_when_env_absent() {
+        // `tls_listen_addr` must never panic regardless of the ambient env.
+        let addr = tls_listen_addr();
         assert!(!addr.trim().is_empty());
     }
 }

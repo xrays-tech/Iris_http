@@ -21,6 +21,7 @@ use pingora::{Error, ErrorType, Result};
 
 use crate::routing::{normalize_host, RouteTarget};
 use crate::state::SharedState;
+use crate::tls::TlsSni;
 
 /// Value advertised in the `Server` response header.
 const SERVER_HEADER: &str = "iris";
@@ -56,6 +57,25 @@ pub struct Ctx {
 pub struct IrisProxy {
     /// The shared configuration/routing/pool snapshots.
     pub shared: Arc<SharedState>,
+}
+
+impl IrisProxy {
+    /// The `(https, site_name)` pair for a matched route, or `None` when the
+    /// host matched no site.
+    fn site_facts(&self, decision: &RouteDecision) -> Option<(bool, String)> {
+        let config = self.shared.config.load();
+        match decision {
+            RouteDecision::Forward { site_idx, .. } => config
+                .forward
+                .get(*site_idx)
+                .map(|site| (site.https, site.name.clone())),
+            RouteDecision::OpenStack { site_idx, .. } => config
+                .openstack
+                .get(*site_idx)
+                .map(|site| (site.https, site.name.clone())),
+            RouteDecision::NotFound => None,
+        }
+    }
 }
 
 /// The routing decision for a request host, after normalisation.
@@ -130,6 +150,30 @@ pub fn should_retry_connect(failures: u32, max_retries: u32) -> bool {
     failures <= max_retries
 }
 
+/// Whether a TLS-terminated request must be refused with `421 Misdirected
+/// Request`.
+///
+/// Only called for requests that arrived over TLS *and* matched a configured
+/// site (`plan/07` §421 semantics):
+/// * a site that does not serve HTTPS (`https == false`) is unreachable on the
+///   TLS listener, and
+/// * a site that does serve HTTPS is only valid when it owns the certificate
+///   the SNI selected (`same_site_as_sni`).
+pub fn should_421(site_https: bool, same_site_as_sni: bool) -> bool {
+    !site_https || !same_site_as_sni
+}
+
+/// The TLS SNI of the current connection, or `None` for a plain-HTTP request.
+///
+/// [`SniCertSource`](crate::tls::SniCertSource) attaches the SNI to the
+/// connection digest's TLS extension; its presence also marks the request as
+/// having arrived over TLS.
+fn tls_sni(session: &Session) -> Option<String> {
+    let digest = session.as_downstream().digest()?;
+    let ssl = digest.ssl_digest.as_ref()?;
+    ssl.extension.get::<TlsSni>().map(|sni| sni.as_str().to_owned())
+}
+
 /// The downstream client IP, if the session exposes one.
 fn client_ip(session: &Session) -> Option<IpAddr> {
     session
@@ -139,16 +183,19 @@ fn client_ip(session: &Session) -> Option<IpAddr> {
         .map(|addr| addr.ip())
 }
 
-/// The request `Host` header value (the caller normalises it).
+/// The request authority (the caller normalises it).
+///
+/// HTTP/1.x carries it in the `Host` header; HTTP/2 carries it in the request
+/// URI (`:authority`) with no `Host` header, so that is the fallback.
 fn request_host(session: &Session) -> String {
-    session
-        .as_downstream()
-        .req_header()
-        .headers
-        .get("host")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_owned()
+    let req = session.as_downstream().req_header();
+    if let Some(host) = req.headers.get("host").and_then(|value| value.to_str().ok()) {
+        return host.to_owned();
+    }
+    req.uri
+        .authority()
+        .map(|authority| authority.as_str().to_owned())
+        .unwrap_or_default()
 }
 
 /// Insert a response header, logging (never panicking) on failure.
@@ -168,7 +215,34 @@ impl ProxyHttp for IrisProxy {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         let host = request_host(session);
-        match decide_route(&self.shared, &host) {
+        let decision = decide_route(&self.shared, &host);
+
+        // Misdirected-request guard (P4): only a TLS connection can be
+        // misdirected. A site that does not serve HTTPS, or one whose
+        // certificate the SNI did not select, must be answered with 421.
+        if let Some(sni) = tls_sni(session) {
+            if let Some((site_https, site_name)) = self.site_facts(&decision) {
+                let same_site_as_sni = self
+                    .shared
+                    .certs
+                    .load()
+                    .lookup(&sni)
+                    .map(|cert| cert.site() == site_name.as_str())
+                    .unwrap_or(false);
+                if should_421(site_https, same_site_as_sni) {
+                    tracing::debug!(
+                        sni = %sni,
+                        host = %host,
+                        site = %site_name,
+                        "misdirected request over TLS; answering 421"
+                    );
+                    session.respond_error(421).await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        match decision {
             RouteDecision::Forward { site, site_idx } => {
                 ctx.route = Some(RouteTarget::Forward(site_idx));
                 ctx.site = Some(site);
@@ -377,5 +451,24 @@ mod tests {
     #[test]
     fn should_retry_connect_with_zero_max_never_retries() {
         assert!(!should_retry_connect(1, 0));
+    }
+
+    // ----- 421 misdirected-request decision -----
+
+    #[test]
+    fn should_421_rejects_http_only_site_over_tls() {
+        // A site that does not serve HTTPS is unreachable on the TLS listener.
+        assert!(should_421(false, true));
+        assert!(should_421(false, false));
+    }
+
+    #[test]
+    fn should_421_rejects_https_site_when_cert_belongs_elsewhere() {
+        assert!(should_421(true, false));
+    }
+
+    #[test]
+    fn should_421_allows_matching_https_site() {
+        assert!(!should_421(true, true));
     }
 }

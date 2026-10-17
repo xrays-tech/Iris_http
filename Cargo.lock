@@ -1215,6 +1215,7 @@ dependencies = [
  "ipnet",
  "moka",
  "notify",
+ "openssl",
  "pingora",
  "pingora-load-balancing",
  "pingora-prometheus",

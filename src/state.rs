@@ -1,9 +1,10 @@
 //! P3 — shared state snapshots (`plan/02-contracts.md` §`src/state.rs`).
 //!
 //! [`SharedState`] owns the lock-free configuration snapshots the request path
-//! reads: the loaded [`Config`], the compiled [`RoutingTable`] and the per-site
-//! forward [`LbEngine`] pool. Every field is a full-snapshot [`ArcSwap`], so a
-//! reader takes an atomic snapshot and never blocks a writer.
+//! reads: the loaded [`Config`], the compiled [`RoutingTable`], the per-SNI
+//! certificate table and the per-site forward [`LbEngine`] pool. Every field is
+//! a full-snapshot [`ArcSwap`], so a reader takes an atomic snapshot and never
+//! blocks a writer.
 //!
 //! P3 creates only the `config` / `routing` / `lbs` fields fixed by the
 //! contract; P4 adds `certs` and P7 adds `firewall` / `resolvers` as purely
@@ -17,6 +18,7 @@ use arc_swap::ArcSwap;
 use crate::config::Config;
 use crate::lb::{build_lb, LbEngine};
 use crate::routing::RoutingTable;
+use crate::tls::SniCertMap;
 
 /// The process-wide shared state read on the request path.
 pub struct SharedState {
@@ -24,12 +26,20 @@ pub struct SharedState {
     pub config: ArcSwap<Config>,
     /// The compiled host-routing table.
     pub routing: ArcSwap<RoutingTable>,
+    /// The per-SNI certificate table served by the TLS listener (P4).
+    pub certs: ArcSwap<SniCertMap>,
     /// Forward-site load balancers, keyed by [`crate::config::ForwardSite::name`].
     pub lbs: ArcSwap<HashMap<String, Arc<LbEngine>>>,
 }
 
 impl SharedState {
-    /// Build the shared state, constructing one load balancer per forward site.
+    /// Build the shared state, constructing one load balancer per forward site
+    /// and the per-SNI certificate table from `config`.
+    ///
+    /// This constructor is infallible by contract: certificate parsing failures
+    /// are logged and yield an empty table here. Startup (`main.rs`) builds the
+    /// real [`crate::tls::SniCertSource`] separately and fails fast on a bad
+    /// certificate, so this best-effort path only matters for reload.
     pub fn new(config: Config, routing: RoutingTable) -> Self {
         let lbs: HashMap<String, Arc<LbEngine>> = config
             .forward
@@ -37,9 +47,21 @@ impl SharedState {
             .map(|site| (site.name.clone(), build_lb(&site.backends, &site.lb_mode)))
             .collect();
 
+        let certs = match SniCertMap::from_sites(&config) {
+            Ok(map) => map,
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to build certificate map; TLS SNI lookup table left empty"
+                );
+                SniCertMap::empty()
+            }
+        };
+
         Self {
             config: ArcSwap::from_pointee(config),
             routing: ArcSwap::from_pointee(routing),
+            certs: ArcSwap::from_pointee(certs),
             lbs: ArcSwap::from_pointee(lbs),
         }
     }
@@ -83,6 +105,14 @@ mod tests {
         SharedState::new(config, routing)
     }
 
+    fn https_site(name: &str, domain: &str) -> ForwardSite {
+        let mut site = forward_site(name, domain, LbMode::RoundRobin);
+        site.https = true;
+        site.cert_file = Some("tests/fixtures/certs/www.example.com.crt".into());
+        site.key_file = Some("tests/fixtures/certs/www.example.com.key".into());
+        site
+    }
+
     #[test]
     fn builds_one_lb_per_forward_site() {
         let state = state_with(vec![
@@ -109,5 +139,22 @@ mod tests {
     fn no_forward_sites_yields_empty_lb_map() {
         let state = state_with(Vec::new());
         assert!(state.lbs.load().is_empty());
+    }
+
+    #[test]
+    fn http_only_sites_yield_empty_cert_map() {
+        let state = state_with(vec![forward_site("www", "www.example.com", LbMode::RoundRobin)]);
+        assert!(state.certs.load().lookup("www.example.com").is_none());
+    }
+
+    #[test]
+    fn https_site_populates_cert_map() {
+        let state = state_with(vec![https_site("www", "www.example.com")]);
+        let cert = state
+            .certs
+            .load()
+            .lookup("www.example.com")
+            .expect("https site certificate is registered");
+        assert_eq!(cert.site(), "www");
     }
 }

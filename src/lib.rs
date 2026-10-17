@@ -14,6 +14,7 @@ pub mod openstack;
 pub mod proxy;
 pub mod routing;
 pub mod state;
+pub mod tls;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
