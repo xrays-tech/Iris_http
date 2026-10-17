@@ -23,7 +23,7 @@ use pingora::proxy::{ProxyHttp, Session};
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
 
-use crate::firewall::{AclVerdict, FirewallTable};
+use crate::firewall::{AclReason, AclVerdict, FirewallTable};
 use crate::openstack::{ResolveError, ResolvedInstance};
 use crate::routing::{normalize_host, RouteTarget};
 use crate::state::SharedState;
@@ -208,6 +208,35 @@ pub fn firewall_verdict_to_http(
     }
 }
 
+/// The metric label for a firewall denial, or `None` when the request is not
+/// denied (`firewall_denied_total{reason}` wiring, P8).
+///
+/// Mirrors [`firewall_verdict_to_http`]'s decision order exactly so the metric
+/// and the HTTP status can never disagree.
+pub fn firewall_denial_reason(
+    firewall: Option<&FirewallTable>,
+    instance: &str,
+    port: u16,
+    client: IpAddr,
+    site_has_firewall: bool,
+) -> Option<&'static str> {
+    if !site_has_firewall {
+        return None;
+    }
+    match firewall {
+        Some(table) => match table.check(instance, port, client) {
+            AclVerdict::Allow => None,
+            AclVerdict::Deny(reason) => Some(match reason {
+                AclReason::NoRole => "no_role",
+                AclReason::PortNotAllowed(_) => "port_not_allowed",
+                AclReason::Blacklisted(_) => "blacklisted",
+                AclReason::NotWhitelisted(_) => "not_whitelisted",
+            }),
+        },
+        None => Some("no_table"),
+    }
+}
+
 /// Map a discovery failure to an outbound HTTP status (`discovery.md` §7).
 ///
 /// `NotFound` → `404`; `AuthFailed` / `DiscoveryUnavailable` / `NoAddress` →
@@ -296,10 +325,23 @@ pub async fn openstack_gate(
     let firewall = shared.firewall.load();
     let table = firewall.get(&site_name).map(|table| table.as_ref());
     let status = match client {
-        Some(ip) => firewall_verdict_to_http(table, instance, port, ip, has_firewall),
+        Some(ip) => {
+            let verdict = firewall_verdict_to_http(table, instance, port, ip, has_firewall);
+            if verdict == Some(403) {
+                if let Some(reason) =
+                    firewall_denial_reason(table, instance, port, ip, has_firewall)
+                {
+                    crate::reload::record_firewall_denied(reason);
+                }
+            }
+            verdict
+        }
         // With a firewall configured but no client address (e.g. a unix
         // socket), fail closed.
-        None if has_firewall => Some(403),
+        None if has_firewall => {
+            crate::reload::record_firewall_denied("no_client");
+            Some(403)
+        }
         None => None,
     };
     if let Some(code) = status {
@@ -786,6 +828,45 @@ mod tests {
         assert_eq!(
             firewall_verdict_to_http(None, "web", 80, ip([127, 0, 0, 1]), true),
             Some(403)
+        );
+    }
+
+    // ----- P8: firewall denial metric label -----
+
+    #[test]
+    fn firewall_denial_reason_labels_match_the_verdict() {
+        let table = firewall_with("web", "allowed_ports: [80]\n");
+        // Allowed and no-firewall cases produce no metric.
+        assert_eq!(
+            firewall_denial_reason(Some(&table), "web", 80, ip([127, 0, 0, 1]), true),
+            None
+        );
+        assert_eq!(
+            firewall_denial_reason(None, "web", 80, ip([127, 0, 0, 1]), false),
+            None
+        );
+        // Each denial reason maps to a distinct label.
+        assert_eq!(
+            firewall_denial_reason(Some(&table), "ghost", 80, ip([127, 0, 0, 1]), true),
+            Some("no_role")
+        );
+        assert_eq!(
+            firewall_denial_reason(Some(&table), "web", 8080, ip([127, 0, 0, 1]), true),
+            Some("port_not_allowed")
+        );
+        let banned = firewall_with("web", "allowed_ports: [80]\nblacklist: [127.0.0.0/8]\n");
+        assert_eq!(
+            firewall_denial_reason(Some(&banned), "web", 80, ip([127, 0, 0, 1]), true),
+            Some("blacklisted")
+        );
+        let locked = firewall_with("web", "allowed_ports: [80]\nwhitelist: [10.0.0.0/8]\n");
+        assert_eq!(
+            firewall_denial_reason(Some(&locked), "web", 80, ip([127, 0, 0, 1]), true),
+            Some("not_whitelisted")
+        );
+        assert_eq!(
+            firewall_denial_reason(None, "web", 80, ip([127, 0, 0, 1]), true),
+            Some("no_table")
         );
     }
 

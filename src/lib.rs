@@ -12,6 +12,7 @@ pub mod lb;
 pub mod logging;
 pub mod openstack;
 pub mod proxy;
+pub mod reload;
 pub mod routing;
 pub mod state;
 pub mod tls;
@@ -65,6 +66,13 @@ pub struct RunArgs {
     /// Watch the configuration directory and reload automatically on change.
     #[arg(long)]
     pub watch_config: bool,
+
+    /// Address for the combined `/metrics`, `/version` and `/healthz` service.
+    ///
+    /// Defaults to `127.0.0.1:9091` (the design default; `9090` is commonly
+    /// taken). The `IRIS_HTTP_METRICS_ADDR` environment variable overrides it.
+    #[arg(long, value_name = "ADDR")]
+    pub metrics_listen: Option<String>,
 }
 
 /// Arguments for `iris reload`.
@@ -154,6 +162,19 @@ mod tests {
                 assert_eq!(args.config_dir, PathBuf::from("./config"));
                 assert_eq!(args.pidfile, None);
                 assert!(!args.watch_config);
+                assert_eq!(args.metrics_listen, None);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_parses_metrics_listen() {
+        let cli = parse_cli_from(["iris", "run", "--metrics-listen", "127.0.0.1:19091"])
+            .expect("run parses");
+        match cli.command {
+            Command::Run(args) => {
+                assert_eq!(args.metrics_listen.as_deref(), Some("127.0.0.1:19091"));
             }
             other => panic!("expected Run, got {other:?}"),
         }

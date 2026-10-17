@@ -13,16 +13,19 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
+use pingora::http::ResponseHeader;
 use pingora::listeners::tls::TlsSettings;
-use pingora::proxy::http_proxy_service;
+use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
 use pingora::server::configuration::{Opt, ServerConf};
 use pingora::server::Server;
 use pingora::services::background::background_service;
+use pingora_prometheus::prometheus::{gather, Encoder, TextEncoder};
 
 use iris_http::config::load_config;
 use iris_http::lb::health_check_service;
 use iris_http::logging;
 use iris_http::proxy::IrisProxy;
+use iris_http::reload::{init_metrics, ReloadService};
 use iris_http::state::SharedState;
 use iris_http::tls::SniCertSource;
 use iris_http::{reload, Cli, Command, RunArgs};
@@ -41,6 +44,12 @@ const TLS_LISTEN_ADDR: &str = "0.0.0.0:443";
 /// Mirrors [`HTTP_LISTEN_ADDR_ENV`] so e2e tests can bind an unprivileged port
 /// without root rather than the production default `0.0.0.0:443`.
 const TLS_LISTEN_ADDR_ENV: &str = "IRIS_HTTP_LISTEN_TLS_ADDR";
+/// Default address of the combined `/metrics`, `/version`, `/healthz` service
+/// (design.md §4.1 / `reload.md` §6; `9090` is commonly taken, so the default
+/// is `9091`).
+const METRICS_LISTEN_ADDR: &str = "127.0.0.1:9091";
+/// Environment override for the metrics/version service address.
+const METRICS_LISTEN_ADDR_ENV: &str = "IRIS_HTTP_METRICS_ADDR";
 /// Time to let in-flight requests drain on graceful shutdown (design.md §4.1:
 /// `grace_period_seconds`; Pingora otherwise defaults to 5 minutes).
 const GRACE_PERIOD_SECONDS: u64 = 5;
@@ -89,6 +98,22 @@ fn tls_listen_addr() -> String {
         .unwrap_or_else(|| TLS_LISTEN_ADDR.to_owned())
 }
 
+/// Resolve the metrics/version listen address.
+///
+/// Precedence: `IRIS_HTTP_METRICS_ADDR` (test/runtime override) > the
+/// `--metrics-listen` CLI value > the built-in default.
+fn metrics_listen_addr(cli: Option<&str>) -> String {
+    std::env::var(METRICS_LISTEN_ADDR_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            cli.map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| METRICS_LISTEN_ADDR.to_owned())
+}
+
 /// Start the proxy server. Diverges: `run_forever` only returns by exiting the
 /// process (graceful shutdown returns exit code 0 — see P0 smoke test).
 fn run(args: RunArgs) -> anyhow::Result<()> {
@@ -134,9 +159,11 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
 
     let listen_addr = http_listen_addr();
     let tls_addr = tls_listen_addr();
+    let metrics_addr = metrics_listen_addr(args.metrics_listen.as_deref());
     let openstack_sites = shared.config.load().openstack.len();
     let resolvers = shared.resolvers.load().len();
     let firewalled_sites = shared.firewall.load().len();
+    let fingerprint = shared.fingerprint.load_full();
     tracing::info!(
         config_dir = %args.config_dir.display(),
         sites_dir = %sites_dir.display(),
@@ -144,10 +171,14 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         openstack_sites,
         resolvers,
         firewalled_sites,
+        fingerprint = %fingerprint.as_str(),
         watch_config = args.watch_config,
         version = env!("CARGO_PKG_VERSION"),
         "starting iris"
     );
+
+    // Register the reload/firewall counters before any /metrics scrape.
+    init_metrics();
 
     let mut server = build_server()?;
     server.bootstrap();
@@ -169,15 +200,113 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
 
     register_health_checks(&mut server, &shared);
 
-    // NOTE: the Prometheus service (`pingora_prometheus::prometheus_http_service()`)
-    // is confirmed to assemble in `probe_tests::service_assembly_compiles`; it is
-    // not bound here because P3 has no metrics to expose yet. Wiring lands with
-    // the metrics in a later stage (P7/P8).
+    // Combined `/metrics`, `/version` and `/healthz` service (P8). It is a
+    // standalone proxy app so it can share nothing with the request lane.
+    let metrics_app = VersionMetricsProxy {
+        shared: Arc::clone(&shared),
+    };
+    let mut metrics_service = http_proxy_service(&server.configuration, metrics_app);
+    metrics_service.add_tcp(&metrics_addr);
+    server.add_service(metrics_service);
 
-    tracing::info!(http = %listen_addr, https = %tls_addr, "iris TLS lane ready; awaiting requests");
+    // Configuration hot-reload: SIGHUP (`iris reload`) and optional
+    // `--watch-config` re-scan, both stopping on shutdown.
+    server.add_service(background_service(
+        "iris-reload",
+        ReloadService::new(
+            Arc::clone(&shared),
+            sites_dir.clone(),
+            env,
+            args.watch_config,
+        ),
+    ));
+
+    tracing::info!(
+        http = %listen_addr,
+        https = %tls_addr,
+        metrics = %metrics_addr,
+        "iris TLS lane ready; awaiting requests"
+    );
 
     // Never returns; graceful SIGTERM shutdown exits the process with code 0.
     server.run_forever()
+}
+
+/// The tiny proxy app that serves `/version`, `/metrics` and `/healthz` on the
+/// dedicated metrics listener (P8, `reload.md` §6).
+///
+/// `/version` returns the current configuration fingerprint (so an operator can
+/// confirm a reload took effect), `/metrics` returns the prometheus
+/// exposition, `/healthz` is a liveness probe, and everything else is `404`.
+struct VersionMetricsProxy {
+    shared: Arc<SharedState>,
+}
+
+/// Write a small plain-text response with explicit headers.
+async fn respond_text(
+    session: &mut Session,
+    status: u16,
+    content_type: &str,
+    body: String,
+) -> pingora::Result<()> {
+    let len = body.len();
+    let mut header = ResponseHeader::build(status, Some(len))?;
+    header.insert_header("Content-Type", content_type)?;
+    header.insert_header("Content-Length", len.to_string())?;
+    session.write_response_header(Box::new(header), false).await?;
+    session.write_response_body(Some(body.into_bytes().into()), true).await?;
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl ProxyHttp for VersionMetricsProxy {
+    type CTX = ();
+
+    fn new_ctx(&self) -> () {}
+
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut ()) -> pingora::Result<bool> {
+        let path = session.as_downstream().req_header().uri.path().to_owned();
+        match path.as_str() {
+            "/version" => {
+                let body = format!(
+                    "binary={} config_hash={}\n",
+                    env!("CARGO_PKG_VERSION"),
+                    self.shared.fingerprint.load_full().as_str()
+                );
+                respond_text(session, 200, "text/plain; charset=utf-8", body).await?;
+            }
+            "/healthz" => {
+                respond_text(session, 200, "text/plain; charset=utf-8", "ok\n".to_owned()).await?;
+            }
+            "/metrics" => {
+                let encoder = TextEncoder::new();
+                let families = gather();
+                let mut buffer = Vec::new();
+                if let Err(err) = encoder.encode(&families, &mut buffer) {
+                    tracing::warn!(error = %err, "failed to encode prometheus metrics");
+                }
+                let body = String::from_utf8_lossy(&buffer).into_owned();
+                respond_text(session, 200, encoder.format_type(), body).await?;
+            }
+            _ => {
+                session.respond_error(404).await?;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut (),
+    ) -> pingora::Result<Box<pingora::upstreams::peer::HttpPeer>> {
+        // `request_filter` always terminates the request, so this is never
+        // reached; it exists only to satisfy the trait.
+        Err(pingora::Error::explain(
+            pingora::ErrorType::InternalError,
+            "version/metrics proxy has no upstream",
+        ))
+    }
 }
 
 /// Register one background health-check service per forward site that
@@ -324,5 +453,29 @@ mod probe_tests {
         // `tls_listen_addr` must never panic regardless of the ambient env.
         let addr = tls_listen_addr();
         assert!(!addr.trim().is_empty());
+    }
+
+    #[test]
+    fn metrics_listen_addr_defaults_and_honours_cli() {
+        // With no env override the CLI value (or default) wins.
+        if std::env::var(METRICS_LISTEN_ADDR_ENV).is_err() {
+            assert_eq!(metrics_listen_addr(None), METRICS_LISTEN_ADDR);
+            assert_eq!(metrics_listen_addr(Some("127.0.0.1:19091")), "127.0.0.1:19091");
+            // A blank CLI value falls back to the default.
+            assert_eq!(metrics_listen_addr(Some("   ")), METRICS_LISTEN_ADDR);
+        }
+    }
+
+    /// P8 metrics/version app assembly probe: the tiny ProxyHttp app builds a
+    /// proxy service that can be bound with `add_tcp`.
+    #[test]
+    fn version_metrics_service_assembly_compiles() {
+        let conf = Arc::new(ServerConf::new().expect("default ServerConf"));
+        let app = VersionMetricsProxy {
+            shared: test_shared(),
+        };
+        let mut svc = http_proxy_service(&conf, app);
+        svc.add_tcp("127.0.0.1:0");
+        assert!(svc.app_logic().is_some());
     }
 }

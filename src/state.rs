@@ -8,7 +8,8 @@
 //! and never blocks a writer.
 //!
 //! P3 created the `config` / `routing` / `lbs` fields fixed by the contract; P4
-//! added `certs`; P7 adds `firewall` / `resolvers` as purely additive fields.
+//! added `certs`; P7 adds `firewall` / `resolvers`; P8 adds the additive
+//! `fingerprint` field (the config content hash served by `/version`).
 //!
 //! [`SharedState::try_new`] replaces P3's infallible `new`: building the
 //! per-site firewall tables can fail (a bad `.role` file must fail startup with
@@ -48,6 +49,11 @@ pub struct SharedState {
     /// Per-openstack-site instance resolvers, keyed by
     /// [`crate::config::OpenStackSite::name`] (P7).
     pub resolvers: ArcSwap<HashMap<String, Arc<dyn Resolver>>>,
+    /// Stable content fingerprint of the loaded configuration (P8).
+    ///
+    /// Exposed by `/version` (and used to short-circuit `--watch-config`
+    /// re-scans); replaced atomically by [`crate::reload::apply_new_config`].
+    pub fingerprint: ArcSwap<String>,
 }
 
 impl SharedState {
@@ -66,6 +72,10 @@ impl SharedState {
     pub fn try_new(config: Config) -> Result<Self, ConfigError> {
         let routing = RoutingTable::try_from(&config)
             .map_err(|err| ConfigError::Validate(err.to_string()))?;
+
+        // The fingerprint is computed from the freshly loaded config before it
+        // is moved into the snapshot (P8, reload.rs).
+        let fingerprint = crate::reload::config_fingerprint(&config);
 
         let lbs: HashMap<String, Arc<LbEngine>> = config
             .forward
@@ -113,6 +123,7 @@ impl SharedState {
             lbs: ArcSwap::from_pointee(lbs),
             firewall: ArcSwap::from_pointee(firewall),
             resolvers: ArcSwap::from_pointee(resolvers),
+            fingerprint: ArcSwap::from_pointee(fingerprint),
         })
     }
 
@@ -207,8 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_one_lb_per_forward_site() {
-        let state = state_with(vec![
+    fn builds_one_lb_per_forward_site() {        let state = state_with(vec![
             forward_site("a", "a.example.com", LbMode::RoundRobin),
             forward_site("b", "b.example.com", LbMode::Ketama),
         ]);
@@ -300,5 +310,34 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, ConfigError::Parse { .. }), "got {err:?}");
+    }
+
+    // ----- P8: config fingerprint -----
+
+    #[test]
+    fn try_new_computes_a_stable_fingerprint() {
+        let config = || Config {
+            forward: vec![forward_site("www", "www.example.com", LbMode::RoundRobin)],
+            openstack: Vec::new(),
+        };
+        let a = SharedState::try_new(config()).expect("state builds");
+        let b = SharedState::try_new(config()).expect("state builds");
+        assert!(!a.fingerprint.load_full().is_empty());
+        assert_eq!(a.fingerprint.load_full().as_str(), b.fingerprint.load_full().as_str());
+    }
+
+    #[test]
+    fn fingerprint_changes_with_the_config() {
+        let a = SharedState::try_new(Config {
+            forward: vec![forward_site("www", "www.example.com", LbMode::RoundRobin)],
+            openstack: Vec::new(),
+        })
+        .expect("state builds");
+        let b = SharedState::try_new(Config {
+            forward: vec![forward_site("www", "www.example.com", LbMode::Ketama)],
+            openstack: Vec::new(),
+        })
+        .expect("state builds");
+        assert_ne!(a.fingerprint.load_full().as_str(), b.fingerprint.load_full().as_str());
     }
 }
