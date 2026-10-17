@@ -1,0 +1,2 @@
+# Empty allowed_ports = deny every port (default deny, firewall.md §4).
+allowed_ports: []

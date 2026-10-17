@@ -1,0 +1,6 @@
+# Non-empty whitelist: clients outside it are denied even when not blacklisted.
+allowed_ports:
+  - 8080
+whitelist:
+  - 10.0.0.0/8
+  - ::1/128

@@ -1,0 +1,5 @@
+# Invalid CIDR: prefix length out of range for IPv4.
+allowed_ports:
+  - 80
+blacklist:
+  - 10.0.0.0/33

@@ -1,0 +1,3 @@
+# Type error: allowed_ports must be a list of integers.
+allowed_ports:
+  - eighty

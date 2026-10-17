@@ -1,0 +1,5 @@
+# Legitimate role: allows 80/443, no whitelist, no blacklist.
+# With an empty whitelist any non-blacklisted client is allowed (firewall.md §2).
+allowed_ports:
+  - 80
+  - 443
