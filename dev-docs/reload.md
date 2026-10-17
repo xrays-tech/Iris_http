@@ -22,36 +22,42 @@
 1. load_config(sites_dir)                      // config.md §6：解析 + 全量校验（纯函数）
 2. 失败? → 打日志 + 指标 config_reload_total{ok=false}；保持旧配置继续服务，进程不退出
    成功? ↓
-3. 构造新 Config 快照（含路由表、LB 描述、证书表、firewall 表、openstack 客户配置）
-4. 逐站点应用（见 §3），全部就绪后：
-   arcswap_config.store(Arc::new(new_config))  // 路由/证书/firewall 的原子切换点
-5. 更新配置指纹（hash）供 /version 与告警对比
+3. 构建一代新 Snapshot（config、路由表、LB 引用、证书表、firewall 表、resolver 表、指纹）；
+   共享 HealthRegistry 沿用旧值，不重建
+4. 全部构建成功后：
+   snapshot.store(Arc::new(new Snapshot))      // 唯一原子切换点（config+routing+certs+firewall+lbs+resolvers 一次发布）
+5. 重算配置指纹（hash）供 /version 与告警对比（覆盖凭据真实值，凭据轮换也能被感知）
 6. 指标 config_reload_total{ok=true}
 ```
 
 - **校验先行**：任何站点文件语法/语义错误都拒绝整份新配置（部分生效会留下无法回溯的混合状态）。
-- 切换点尽量收敛到一次 `ArcSwap::store`（路由表 + 证书表 + firewall 表可打包进同一 `Config` 结构，或各自 `ArcSwap` 但**先构建后发布**，杜绝读到半新状态）。
+- **单一快照原子切换**（FIX #3）：`SharedState` 只持有一个 `ArcSwap<Snapshot>`，请求路径在 `request_filter` 取一次快照并在后续 filter 复用；因此**不存在半新状态**。
 
 ## 3. 各类配置变更的生效机制
 
 | 变更 | 生效点 | 机制 |
 |---|---|---|
-| forward 后端增删/权重变化 | 对应站点 `LoadBalancer` | `lb.update(backends)`：原子替换 selector 表，在途请求继续用旧迭代器，不受影响（Pingora 文档语义） |
-| 负载均衡算法变化 | 对应站点 LB | 重建 `LoadBalancer` 并整体 `ArcSwap` 替换引用（不再有请求指向旧实例时回收） |
-| 站点新增/删除/域名变化 | 路由表 | `ArcSwap<RoutingTable>` store；新请求即见新表 |
-| openstack 站点参数（auth/api 等） | 站点解析器 | 重建解析器并 `ArcSwap`；**进程内缓存保留**（同实例 key 继续命中，避免重载打冲击穿） |
-| `firewall_dir`/role 文件变化 | 防火墙表 | 重载时重读全部 `.role`；随路由快照发布 |
-| 证书/密钥变化 | SNI 回调 | `TlsAccept.certificate_callback` 每握手读 `ArcSwap<CertMap>` 当前快照；新握手即用新证书，旧握手不受影响 |
+| forward 后端增删/权重变化 | 对应站点 `LoadBalancer` | 池相关配置未变则复用同一 `Arc<LbEngine>`；变了则重建，但都共享同一 `HealthRegistry`：`lb.update(backends)` 原子替换 selector，观察到的健康状态沿用 |
+| 负载均衡算法变化 | 对应站点 LB | 用共享 registry 重建 `LoadBalancer`，随快照发布（算法变化会换引擎，但探针与健康状态仍在共享表内） |
+| 站点新增/删除/域名变化 | 路由表 | 随单一快照发布；新请求即见新表 |
+| openstack 站点参数（auth/api 等） | 站点解析器 | 未变则复用同一 `Arc<dyn Resolver>`；**进程内缓存保留**（同实例 key 继续命中，避免重载打冲击穿）。变了则重建 |
+| `firewall_dir`/role 文件变化 | 防火墙表 | 重载时重读全部 `.role`；随快照发布 |
+| 证书/密钥变化 | SNI 回调 | `SniCertSource` 读取与代理/reload **同一个** `ArcSwap<Snapshot>` 的 `certs`；新握手即用新证书，旧握手不受影响（FIX #1） |
+| 健康检查规格/间隔变化 | 共享探针 | `ProbeRegistry.sync(&config)` 按新配置重指向站点级 probe 并重置其 interval 计时；恢复/剔除在下次探测生效（FIX #2） |
+| forward 站点被移除 | 共享探针 + 共享 registry | `ProbeRegistry.sync` 不再为其建表；引擎被释放时其 `Backends` view 移除，registry 注销其后端（FIX #8） |
 | `cache_ttl_secs` 等 | 缓存参数 | 解析器重建时对新缓存条目生效；存量条目照旧 TTL |
 
-实现要点：`certificate_callback(&self)` 只读 `&self`（Trait 签名），证书表用 `ArcSwap` 存于回调实例内，实现"外部 store、回调只读"。
+实现要点：
+- `certificate_callback(&self)` 只读 `&self`（Trait 签名）；证书表不再有独立 store，回调读取与代理共享的 `Snapshot.certs`（FIX #1）。
+- 共享 `HealthRegistry` 由启动时注册的**单个** `HealthCheckService` 驱动；`ProbeRegistry` 是注册表唯一的探针，按后端分派到站点级 probe 并各自遵守 `interval_secs`。新增/变更站点的引擎自动向该共享 registry 贡献后端，无需重挂探针（FIX #2）。
+- 加载列表外的站点（reload 移除的 forward 站点）不再被探测；其引擎的 view 随最后一个 `Arc<LbEngine>` 释放而注销（FIX #8）。
 
 ## 4. 并发与一致性
 
-- 所有共享快照（config、routing、cert map、firewall、LB 引用、last-known-good）为 `Arc`/`ArcSwap`；**读路径无锁**，写路径单点（重载后台服务）。
-- 重载不在请求处理路径中加锁；`upstream_peer`/`request_filter` 每请求最多再取一次快照引用（`load()` 开销 O(1)）。
+- 整代配置打包为单一 `Snapshot`（config、routing、cert map、firewall、LB 引用、resolver 表、指纹），经**一个** `ArcSwap<Snapshot>` 原子发布（FIX #3）；**读路径无锁**，写路径单点（重载后台服务）。共享 `HealthRegistry`（及 `ProbeRegistry`）跨代不变。
+- 重载不在请求处理路径中加锁；`request_filter` 每请求只取一次快照引用，`upstream_peer`/`fail_to_connect`/`openstack_gate`/421 校验全部复用该引用（`load()` 开销 O(1)）。
 - 高并发重载（连发多次 SIGHUP）：重载服务串行处理（channel/mutex），以最后一次有效校验结果为准，先建后换保证幂等。
-- 重载进行中允许的新请求天然落在"发布前旧"或"发布后新"，**不存在半新状态**（原子 store）。
+- 重载进行中允许的新请求天然落在"发布前旧"或"发布后新"，**不存在半新状态**（单一原子 store）。
 
 ## 5. 生命周期与信号约定（对齐 Pingora）
 
@@ -75,11 +81,12 @@
 
 ## 7. 测试策略（reload 专项）
 
-- 单元：重载流程状态机（成功切换/校验失败保持旧配置）、配置指纹计算、幂等重载。
+- 单元：重载流程状态机（成功切换/校验失败保持旧配置）、配置指纹计算（含仅凭据轮换变化，FIX #4）、幂等重载、单一快照原子性、共享 registry 注册（FIX #2）。
 - 集成（组合 mock Nova + 双后端模拟上游）：
   1. 重载新增站点 → 新 Host 立即路由成功；旧站点在途 WebSocket 连接不断。
   2. 重载后端集合 → `lb.update` 生效；在途请求不 5xx。
-  3. 证书更换 → 新握手拿到新证书（`openssl s_client -servername` 验证）；旧连接持续到自然结束。
+  3. 证书更换/新增 → 新握手拿到新证书（`openssl s_client -servername` 验证）；旧连接持续到自然结束。E2E：`scripts/e2e/10-tls-reload.sh`（FIX #1，重载前断言握手中断、重载后断言新证书 CN/SAN）。
   4. 坏配置重载 → 返回错误日志，进程继续服务旧配置。
   5. `kill -HUP` 后 `/version` 的 config_hash 变化。
-- 全部走 `cargo build` + `cargo test` 闭环。
+  6. 重载新增带健康检查的站点 → 其后端立即被共享探针门控（不健康后端永不被选中）；重载改健康检查间隔 → 重新探测。E2E：`scripts/e2e/11-health-reload-new-site.sh`（FIX #2）；`scripts/e2e/09-health-reload.sh`（不变站点引擎复用，健康状态跨重载保留）。
+- 全部走 `cargo build` + `cargo test` + `scripts/e2e/*.sh` 闭环。

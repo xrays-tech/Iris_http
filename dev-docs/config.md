@@ -102,6 +102,7 @@ openstack:
 - `auth.api_url` 为 Keystone 版本端点（`/v3`）。`nova.api_url` 缺省时用 token 响应中的服务目录（`nova` 服务 / `compute` 类型 / 匹配 region）发现，与 Iris_ssh 的 `nova_base_from_catalog` 一致。
 - 凭据不得写入站点文件明文：secret 推荐一律走 `${ENV}`（§7）；字面量值亦会被解析（无法在展开后可靠区分），属运维规范违规；日志与 `Debug` 永不落任何 secret。
 - `cache_ttl_secs` 默认 86400（1 天）；负缓存与瞬时错误 TTL 为固定值（见 `discovery.md`）。
+- `timeout_secs` 默认 5，单次 Nova 请求超时；校验范围 `[1, 600]`（0 会让每次请求瞬时失败 → 持续 502；上限 10 分钟）。
 
 ## 5. 负载均衡模式枚举（仅 forward）
 
@@ -127,7 +128,7 @@ openstack:
    - `domain` 不得与 `base_domain` 重叠。
    - HTTPS 站点证书/密钥文件存在且可读（`reload` 时对文件变更做 stat，内容变更在 SNI 选择时天然生效）。
    - forward：`backends` 非空、`addr` 可解析为 `IP:port`。
-   - openstack：`auth.api_url` 为有效 URL；凭据方式字段齐备；`cache_ttl_secs` 在 `[60, 7*86400]`（至少 1 分钟、最多 7 天，防止配置性价比倒挂）；`firewall_dir` 若配置则目录存在。
+   - openstack：`auth.api_url` 为有效 URL；凭据方式字段齐备；`cache_ttl_secs` 在 `[60, 7*86400]`（至少 1 分钟、最多 7 天，防止配置性价比倒挂）；`timeout_secs` 在 `[1, 600]`（0 会导致每次 Nova 请求瞬时失败）；`firewall_dir` 若配置则目录存在。
    - `port` 合法性上限：解析出的端口 `1..=65535`（见 §8）。
 
 ## 7. 敏感信息与环境变量展开
