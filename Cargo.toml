@@ -1,0 +1,39 @@
+[package]
+name = "iris-http"
+version = "0.1.0"
+edition = "2021"
+description = "Iris HTTP — Pingora-based reverse proxy (forward + OpenStack auto-discovery)"
+license = "MIT"
+
+[lib]
+name = "iris_http"
+path = "src/lib.rs"
+
+[[bin]]
+name = "iris"
+path = "src/main.rs"
+
+[dependencies]
+pingora = { version = "0.9", features = ["openssl", "proxy", "lb"] }
+pingora-proxy = "0.9"
+pingora-load-balancing = "0.9"
+pingora-prometheus = "0.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+arc-swap = "1"
+moka = { version = "0.12", features = ["future"] }
+ipnet = "2"
+notify = "7"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
+url = "2"
+async-trait = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
