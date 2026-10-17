@@ -38,7 +38,7 @@ pub struct RoutingTable { exact: HashMap<String, SiteKind>, openstack_patterns: 
 pub enum SiteKind { Forward(usize), OpenStack(usize) }               // 索引进 Config
 pub struct OpenStackPattern { pub site_idx: usize, pub base_domain: String } // regex 编译后字段私有
 pub enum RouteTarget { Forward(usize), OpenStack { site_idx: usize, instance: String, port: u16 } }
-pub fn normalize_host(host: &str) -> String;                        // 小写、去尾点、去端口
+pub fn normalize_host(host: &str) -> String;                        // 小写、去尾点、去缺省端口(:80/:443)，非缺省端口保留
 pub fn parse_instance_host(prefix_suffix: &str, base_domain: &str) -> Option<(String, u16)>;
 pub impl RoutingTable { pub fn lookup(&self, host: &str) -> Option<RouteTarget>; }
 
@@ -74,6 +74,8 @@ pub enum LbEngine { RR(...), Random(...), Ketama(...) }              // 分别�
 impl LbEngine {
     pub fn select(&self, hash_key: Option<IpAddr>) -> Option<SocketAddr>; // ketama 用客户端 IP 作 hash 键；其余忽略
     pub fn update(&self, backends: &[Backend]);                       // 委托底层 lb.update()（原子换表）
+    // ⚠更新：若 P0 探针确认 update() 需 &mut self，则以内部锁封装实现 &self 语义；超出该前提走设计变更回报，不得静默改签。
+    // weight=0 后端必须完全排除：不进 Pingora 后端列表、不参与选择、不进入健康检查（P3 单测覆盖）。
 }
 pub fn build_lb(backends: &[Backend], mode: &LbMode) -> Arc<LbEngine>;
 pub fn health_check_service(lb: Arc<LbEngine>, hc: &HealthCheck) -> impl BackgroundService;
@@ -81,7 +83,7 @@ pub fn health_check_service(lb: Arc<LbEngine>, hc: &HealthCheck) -> impl Backgro
 // src/proxy.rs
 pub struct Ctx { pub route: Option<RouteTarget>, pub upstream: Option<SocketAddr>,
                  pub site: Option<String>, pub instance: Option<String> }
-pub struct IrisProxy { pub shared: Arc<SharedState> }                 // SharedState 见 P8
+pub struct IrisProxy { pub shared: Arc<SharedState> }                 // SharedState 见 src/state.rs（P3 首创、逐阶段加字段）
 
 // src/tls.rs — 证书映射：forward 站点(https) 进 exact；openstack 站点(https) 进 bases（需通配证书 *.base_domain）
 pub struct SniCertMap { exact: HashMap<String, Arc<CertKey>>, bases: Vec<(String, Arc<CertKey>)> }

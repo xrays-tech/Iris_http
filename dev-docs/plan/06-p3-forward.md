@@ -18,7 +18,7 @@
 
 ## TDD 单测清单
 - `LbMode → selection` 映射（表驱动）。
-- `Backend` 构建与 `addr:port` 解析、权重默认/归一。
+- `Backend` 构建与 `addr:port` 解析、权重默认/归一；**`weight=0` 后端完全排除**（不进后端列表/健康检查）。
 - 健康状态切换抽成项目自有纯函数（如 `HealthState::next(observed: bool)`）单测；Pingora `TcpHealthCheck` 内部不测。
 
 ## 端到端
