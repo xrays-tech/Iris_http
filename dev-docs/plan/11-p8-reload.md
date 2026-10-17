@@ -7,13 +7,14 @@
 ## 目标
 - `SharedState`（`02-contracts.md`；config/routing/lbs/certs/firewall/resolvers 全部字段已由前序阶段创建，本阶段只使用）。
 - `ReloadService` 实现 `BackgroundService`：
-  - 监听来源：`SIGHUP`（`iris reload` 发；**按 P0 API 探针结论**——若 Pingora `run_forever` 未接管 SIGHUP，本阶段用 tokio `SignalKind::hangup()` 注册触发，防止缺省行为杀进程）与 `--watch-config` 时的目录变化（`notify`，debounce）；
+  - ✅P0 探针已确认：Pingora `run_forever` 只注册 SIGQUIT/SIGTERM/SIGINT，**SIGHUP 未被接管**（缺省动作终止进程，实测 `iris reload` 后 wait status 129）。
+  - 监听来源：`SIGHUP`（`iris reload` 发；本阶段**必须**自建 tokio `SignalKind::hangup()` 任务触发重载，不与 Pingora 冲突）与 `--watch-config` 时的目录变化（`notify`，debounce）；
   - 触发 `apply_new_config(state, cfg)`：`load_config` 校验 → **失败保持旧配置**（日志 + 指标）→ 成功则：
     - forward LB：后端集合变化 → `lb.update()`；算法变化 → 重建 LB 整体替换；
     - `ArcSwap` 原子换 routing/certs/firewall；
     - openstack resolver 重建后整体替换（进程内缓存保留，避免重载击穿）；
     - 更新 `/version` 配置指纹（内容 hash）。
-- `main.rs`：`SIGHUP`→重载、`SIGTERM`→优雅关闭、`SIGQUIT`→升级预留；后台服务统一 `shutdown.changed()` 收敛；`pingora_prometheus::prometheus_http_service()` 挂独立端口；`/version` 返回 `{binary, config_hash}`。
+- `main.rs`：`SIGHUP`→重载、`SIGTERM`→优雅关闭、`SIGQUIT`→升级预留；后台服务统一 `shutdown.changed()` 收敛；`pingora_prometheus::prometheus_http_service()` 挂独立端口（新增 `--metrics-listen`，默认 `127.0.0.1:9091`，可配——本机 9090 被占）；`/version` 返回 `{binary, config_hash}`。
 
 ## TDD 单测清单
 - `apply_new_config`：成功切换（新配置生效）、校验失败保持旧态（断言旧 `config_hash` 不变）、幂等重载。

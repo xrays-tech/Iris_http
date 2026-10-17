@@ -18,7 +18,7 @@
 
 ## 3. fixtures
 
-- `tests/fixtures/empty-config/`：空 `sites/` 目录（P0 冒烟用）。
+- `tests/fixtures/config/sites/`：空 `sites/` 子目录（`--config-dir` 根目录语义，P0 冒烟/启动用）。
 - `tests/fixtures/sites/*.yaml`：P1 起各正反例站点文件（含重复域名、base_domain 冲突、缺证书、坏枚举等）。
 - `tests/fixtures/certs/`：测试自签证书与私钥（P4 用；测试代码内生成或仓储提交）。
 - `tests/fixtures/openstack/servers/*.json`：Nova 响应样例

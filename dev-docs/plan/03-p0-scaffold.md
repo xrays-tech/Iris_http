@@ -7,6 +7,7 @@
 ## 目标
 - Cargo 工程与全部依赖落定（见下），`Cargo.lock` 提交。
 - CLI（clap）：`iris run --config-dir <dir> [--pidfile <path>] [--watch-config]`、`iris reload [--pidfile <path>]`（读取 pidfile 发 `SIGHUP`）。
+- `--config-dir` 语义（P1 落定）：**配置根目录**，站点文件位于其 `sites/` 子目录（config.md §1，如 `/etc/iris` 或 `./config`）；P0 曾按 `./sites` 直指站点目录，P1 统一为 `<config-dir>/sites` 并同步测试。
 - `tracing` JSON + 控制台日志；`src/errors.rs` 错误类型基座。
 
 ## 依赖与版本（P0 独家落定）
@@ -27,7 +28,7 @@ notify = "7"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }   # EnvFilter 需 env-filter 特性（P0 探针确认）
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }   # OpenStack 客户端
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"

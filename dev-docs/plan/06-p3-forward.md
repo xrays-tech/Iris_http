@@ -10,11 +10,20 @@
   - `WeightedRoundRobin` → `LoadBalancer<RoundRobin>` + 权重（Pingora 加权轮询原生行为）
   - `Random` → `LoadBalancer<Random>`
   - `Ketama` → `LoadBalancer<Consistent>`（hash 键 = 客户端 IP，会话亲和）
-  - 内层泛型与 weight 字段形态以 **P0 API 探针**实测为准；如 `Consistent` 需特性则开启 `consistent-hashing`。
-- `LbEngine::select(hash_key)` / `LbEngine::update(backends)`：委底层 `lb.select()` / `lb.update()`（原子换表，在途请求不受影响）。
-- `health_check_service`：`TcpHealthCheck` / `HttpHealthCheck` + `lb.update_frequency` 周期；`build_lb` 返回的 LB 可通过 `update()` 热更。
+  - 内层形态已由 **P0 API 探针**确认（见下节）；`pingora-load-balancing` 0.9 **无 `consistent-hashing` 特性**，`Consistent` 恒编译。
+- `LbEngine::select(hash_key)`：委底层 `select(&self, key: &[u8], max_iterations)` —— ketama 用客户端 IP 字节作 key，RR/Random 忽略（P0 探针确认签名）。
+- `LbEngine::update(backends)`：由配置**重建** Pingora LoadBalancer 并原子换内层 `ArcSwap`（不依赖 `LoadBalancer::update()` 的 discovery 语义；符合 reload.md『重建整体替换』）。
+- `health_check_service`：`TcpHealthCheck` / `HttpHealthCheck` + `update_frequency` 周期（Pingora 自推进）；项目自有 `HealthState` 纯函数仅作代理侧观测用。
 - `proxy.rs` **forward 分支**：`request_filter` —— `normalize_host` → `RoutingTable.lookup` → 未命中 404；`upstream_peer` —— `lb.select()` → `HttpPeer::new(addr, false, "")`，附 `PeerOptions`（连接超时/重试）；`fail_to_connect` 有限重试（默认 1 次）并记录指标；`response_filter` 注入标准安全头；`Ctx` 记录 route/site/upstream。
-- `main.rs` 最小装配：`Server::bootstrap` + `0.0.0.0:80` 监听（`add_listener`）+ 单 forward 站点可跑；`run_forever`。
+- `main.rs` 最小装配：`Server::bootstrap` + `http_proxy_service(&conf, app)` → `svc.add_tcp("0.0.0.0:80")`（**无 `Server::add_listener`**，P0 探针确认）→ `run_forever`；单 forward 站点可跑。
+
+## P0 探针结论（P3 实现依据；`02-contracts.md` 契约不变）
+- 选择即泛型：`LoadBalancer<S> where S: BackendSelection`；别名 `RoundRobin = Weighted<algorithms::RoundRobin>`、`Random = Weighted<algorithms::Random>`、`Consistent = consistent::KetamaHashing`。
+- `Backend { addr: SocketAddr, weight: usize, ext: Extensions }`；构造 `Backend::new(addr)`（weight=1）与 `Backend::new_with_weight(addr, weight)`。
+- `select(&self, key: &[u8], max_iterations: usize) -> Option<Backend>`。
+- `LoadBalancer::update(&self) -> Result<()>`：async、无参、重跑 discovery——**不适用**静态 YAML 配置；本项目的热更路径是重建 LB 整体换内层。
+- 监听：`http_proxy_service(&conf, app)` → `svc.add_tcp/add_tls_with_settings` → `server.add_service`；无 `Server::add_listener`。
+- `background_service(name, task)` 两参；`BackgroundService::start(&self, shutdown: ShutdownWatch)`；`prometheus_http_service()` 可装配。
 
 ## TDD 单测清单
 - `LbMode → selection` 映射（表驱动）。

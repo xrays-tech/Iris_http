@@ -43,7 +43,7 @@ notify = "7"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }   # OpenStack 客户端
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"

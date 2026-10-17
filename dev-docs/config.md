@@ -4,7 +4,7 @@
 
 ## 1. 配置目录组织
 
-程序启动时以 `--config-dir`（默认 `./config` 或 `/etc/iris`）定位配置：
+程序启动时以 `--config-dir`（默认 `./config` 或 `/etc/iris`）定位配置；**`--config-dir` 是配置根目录，`sites/` 为其子目录**。主程序将 `--config-dir` 推导为 `<config-dir>/sites` 后交给 `load_config`。
 
 ```
 config/

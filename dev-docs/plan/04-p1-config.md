@@ -1,11 +1,12 @@
 # P1 — 配置解析与校验（纯函数核心，所有 lanes 的基座）
 
 - **依赖**：P0。
-- **文件范围**：`src/config/mod.rs`、`src/config/forward.rs`、`src/config/openstack.rs`。
+- **文件范围**：`src/config/mod.rs`、`src/config/forward.rs`、`src/config/openstack.rs`、`src/main.rs`（仅 config-dir 推导与缺省值修正，见下）。
 - **设计参考**：`config.md` 全部（§3/§4/§6/§7）；契约见 `02-contracts.md`。
 
 ## 目标
 - 落定 `02-contracts.md` 中 `Config` / `ForwardSite` / `OpenStackSite` / `LbMode` / `HealthCheck` / `AuthConfig` / `NovaConfig` / `ConfigError` / `load_config` 的真实类型。
+- **统一 `--config-dir` 语义**（config.md §1）：根目录含 `sites/`；`main.rs` 由 `--config-dir` 推导 `<config-dir>/sites` 传给 `load_config`；修正 P0 阶段把 `--config-dir` 直指 `./sites` 的缺省值与相关测试（`tests/fixtures/empty-config` 按新语义重命名为 `tests/fixtures/config/sites/` 或同步调整）。
 - `${ENV}` 展开；redacted `Debug`（secret 打码，不进日志）。
 
 ## TDD 单测清单
