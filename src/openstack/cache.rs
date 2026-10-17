@@ -15,7 +15,7 @@ use moka::future::Cache;
 use moka::Expiry;
 use url::Url;
 
-use super::auth::{fetch_token, AuthError, Token};
+use super::auth::{fetch_token_with_timeout, AuthError, Token};
 use super::{HttpClient, ResolveError, ResolvedInstance};
 use crate::config::AuthConfig;
 
@@ -268,6 +268,55 @@ impl FlightMap {
     }
 }
 
+/// RAII guard owned by the single-flight leader for the duration of its
+/// `attempt` (`discovery.md` §6.2).
+///
+/// The happy path calls [`LeaderGuard::finish`], which publishes the real
+/// result and clears the in-flight slot. If the leader's future is dropped
+/// before that (downstream abort, request cancellation, shutdown), [`Drop`]
+/// publishes a cancellation error instead and clears the slot. Without this a
+/// cancelled leader would leave the [`FlightMap`] entry (and its watch sender)
+/// alive forever, so every later `join` for the key would park on a flight that
+/// never publishes — poisoning the key for the life of the process.
+pub(crate) struct LeaderGuard<'a> {
+    flights: &'a FlightMap,
+    key: String,
+    published: bool,
+}
+
+impl<'a> LeaderGuard<'a> {
+    /// Create a guard for the leader of `key`.
+    pub(crate) fn new(flights: &'a FlightMap, key: &str) -> Self {
+        Self {
+            flights,
+            key: key.to_owned(),
+            published: false,
+        }
+    }
+
+    /// Publish the leader's real `result` to followers and clear the slot.
+    pub(crate) fn finish(mut self, result: &FlightResult) {
+        self.publish(result);
+    }
+
+    fn publish(&mut self, result: &FlightResult) {
+        self.published = true;
+        self.flights.finish(&self.key, result);
+    }
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            // The leader future was cancelled mid-flight: unblock parked
+            // followers with an error and release the key so it can be retried.
+            self.publish(&Err(ResolveError::DiscoveryUnavailable(
+                "single-flight leader cancelled".to_owned(),
+            )));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Token cache
 // ---------------------------------------------------------------------------
@@ -287,11 +336,15 @@ impl TokenCache {
     }
 
     /// Return a valid token, fetching a fresh one when missing or near expiry.
+    ///
+    /// `timeout` bounds the underlying Keystone request (FIX #6); the mutex is
+    /// only held for at most that long.
     pub(crate) async fn get(
         &self,
         auth: &AuthConfig,
         api_url: &Url,
         client: &HttpClient,
+        timeout: Duration,
     ) -> Result<Token, AuthError> {
         let mut guard = self.inner.lock().await;
         if let Some(token) = guard.as_ref() {
@@ -299,7 +352,7 @@ impl TokenCache {
                 return Ok(token.clone());
             }
         }
-        let token = fetch_token(auth, api_url, client).await?;
+        let token = fetch_token_with_timeout(auth, api_url, client, timeout).await?;
         *guard = Some(token.clone());
         Ok(token)
     }
@@ -310,9 +363,10 @@ impl TokenCache {
         auth: &AuthConfig,
         api_url: &Url,
         client: &HttpClient,
+        timeout: Duration,
     ) -> Result<Token, AuthError> {
         let mut guard = self.inner.lock().await;
-        let token = fetch_token(auth, api_url, client).await?;
+        let token = fetch_token_with_timeout(auth, api_url, client, timeout).await?;
         *guard = Some(token.clone());
         Ok(token)
     }

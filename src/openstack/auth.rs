@@ -12,6 +12,7 @@
 //! authentication attempt.
 
 use std::fmt;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,11 @@ use crate::config::{AuthConfig, AuthCredentials};
 /// A token is considered stale this many seconds before its real expiry, so the
 /// next request refreshes it rather than racing the deadline (`discovery.md` §3).
 pub const EARLY_REFRESH_SECS: i64 = 60;
+
+/// Fallback bound for a Keystone token request when the caller does not supply a
+/// site-specific timeout. Guarantees a direct [`fetch_token`] call can never
+/// block forever (the resolver path uses the site's `timeout_secs` instead).
+pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A Keystone token together with the Nova endpoint it authorises.
 #[derive(Clone, PartialEq, Eq)]
@@ -98,10 +104,27 @@ fn auth_endpoint(api_url: &Url) -> Result<Url, AuthError> {
 ///
 /// `api_url` is the Keystone v3 base (`config.auth.api_url`); call sites pass
 /// `(&site.auth, &site.auth.api_url, client)` per `02-contracts.md`.
+///
+/// The request is bounded by [`DEFAULT_AUTH_TIMEOUT`]; the resolver path uses
+/// [`fetch_token_with_timeout`] with the site's `timeout_secs` (FIX #6).
 pub async fn fetch_token(
     cfg: &AuthConfig,
     api_url: &Url,
     client: &HttpClient,
+) -> Result<Token, AuthError> {
+    fetch_token_with_timeout(cfg, api_url, client, DEFAULT_AUTH_TIMEOUT).await
+}
+
+/// [`fetch_token`] with an explicit request timeout.
+///
+/// The timeout covers the whole round trip (connect + response + body), so a
+/// stalling Keystone can never hold the caller (and, upstream, the token-cache
+/// mutex) longer than `timeout`.
+pub(crate) async fn fetch_token_with_timeout(
+    cfg: &AuthConfig,
+    api_url: &Url,
+    client: &HttpClient,
+    timeout: Duration,
 ) -> Result<Token, AuthError> {
     let endpoint = auth_endpoint(api_url)?;
     let body = build_auth_body(&cfg.credentials);
@@ -109,6 +132,7 @@ pub async fn fetch_token(
     let response = client
         .inner()
         .post(endpoint)
+        .timeout(timeout)
         .header(reqwest::header::ACCEPT, "application/json")
         .json(&body)
         .send()

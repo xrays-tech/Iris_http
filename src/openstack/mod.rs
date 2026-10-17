@@ -27,7 +27,7 @@ use url::Url;
 use self::auth::{AuthError, Token};
 use self::cache::{
     build_cache, random_basis_points, ttl_for, Breaker, CacheEntry, DiscoveryCache, FlightMap,
-    FlightRole, Stored, TokenCache, BREAKER_THRESHOLD,
+    FlightRole, LeaderGuard, Stored, TokenCache, BREAKER_THRESHOLD,
 };
 use self::nova::{exact_name_match, query_servers, select_address, NovaError, NovaServer};
 use crate::config::{Config, OpenStackConfig};
@@ -213,7 +213,7 @@ impl Fetcher for OpenStackFetcher {
     async fn fetch(&self, instance: &str) -> Result<ResolvedInstance, FetchError> {
         let token = self
             .token
-            .get(&self.auth, &self.keystone, &self.client)
+            .get(&self.auth, &self.keystone, &self.client, self.timeout)
             .await
             .map_err(map_auth_error)?;
 
@@ -223,7 +223,7 @@ impl Fetcher for OpenStackFetcher {
                 // Refresh once and retry (`discovery.md` §3).
                 let token = self
                     .token
-                    .force_refresh(&self.auth, &self.keystone, &self.client)
+                    .force_refresh(&self.auth, &self.keystone, &self.client, self.timeout)
                     .await
                     .map_err(map_auth_error)?;
                 match self.query(instance, &token).await {
@@ -301,8 +301,13 @@ impl OpenStackResolver {
         match self.flights.join(instance) {
             FlightRole::Follower(flight) => flight.wait().await,
             FlightRole::Leader(_flight) => {
+                // RAII guard: publishes the result and clears the in-flight
+                // slot on the happy path; if this future is dropped mid-`await`
+                // the guard's `Drop` publishes a cancellation error so parked
+                // followers unblock and the key is never poisoned (FIX #5).
+                let guard = LeaderGuard::new(&self.flights, instance);
                 let result = self.attempt(instance).await;
-                self.flights.finish(instance, &result);
+                guard.finish(&result);
                 result
             }
         }
@@ -436,6 +441,8 @@ mod tests {
         NoAddress,
         AuthFailed,
         Transient,
+        /// Never completes (a hung control plane) — used to cancel a leader.
+        Hang,
     }
 
     struct FakeFetcher {
@@ -469,12 +476,14 @@ mod tests {
             if !self.delay.is_zero() {
                 tokio::time::sleep(self.delay).await;
             }
-            match self.reply.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            let reply = self.reply.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            match reply {
                 Reply::Ok(resolved) => Ok(resolved),
                 Reply::NotFound => Err(FetchError::NotFound),
                 Reply::NoAddress => Err(FetchError::NoAddress),
                 Reply::AuthFailed => Err(FetchError::AuthFailed),
                 Reply::Transient => Err(FetchError::Transient("boom".to_owned())),
+                Reply::Hang => std::future::pending::<Result<ResolvedInstance, FetchError>>().await,
             }
         }
     }
@@ -540,6 +549,48 @@ mod tests {
             assert_eq!(resolved.floating, Some(ipv4([10, 0, 0, 7])));
         }
         assert_eq!(fetcher.calls(), 1, "concurrent resolves fold into one fetch");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_leader_does_not_poison_the_single_flight_key() {
+        let fetcher = Arc::new(FakeFetcher::new(Reply::Hang, Duration::ZERO));
+        let resolver = Arc::new(resolver_with(fetcher.clone()));
+
+        // The leader enters the flight and hangs on the never-returning fetch.
+        let leader = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.resolve("web").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A concurrent lookup parks on that flight instead of leading.
+        let follower = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.resolve("web").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fetcher.calls(), 1, "follower must park on the leader's flight");
+
+        // Cancel the leader mid-`await`: the RAII guard must publish a failure.
+        leader.abort();
+        let _ = leader.await;
+
+        let follower_outcome = tokio::time::timeout(Duration::from_secs(2), follower)
+            .await
+            .expect("follower must unblock after leader cancellation")
+            .expect("follower task joins");
+        assert!(
+            matches!(follower_outcome, Err(ResolveError::DiscoveryUnavailable(_))),
+            "cancelled leader must publish a failure, got {follower_outcome:?}"
+        );
+
+        // The key must be usable again: a fresh resolve is not poisoned.
+        fetcher.set_reply(Reply::Ok(inst([10, 0, 0, 5])));
+        let recovered = tokio::time::timeout(Duration::from_secs(2), resolver.resolve("web"))
+            .await
+            .expect("key must not be poisoned")
+            .expect("recovers after cancellation");
+        assert_eq!(recovered.floating, Some(ipv4([10, 0, 0, 5])));
     }
 
     #[tokio::test]

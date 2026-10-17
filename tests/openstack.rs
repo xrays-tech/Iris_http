@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use iris_http::config::{AuthConfig, AuthCredentials, NovaConfig, OpenStackConfig};
 use iris_http::openstack::{HttpClient, OpenStackResolver, ResolveError};
@@ -173,6 +174,29 @@ async fn auth_failure_is_reported_as_auth_failed() {
     assert_eq!(
         resolver.resolve("multi-nic").await.unwrap_err(),
         ResolveError::AuthFailed
+    );
+}
+
+#[tokio::test]
+async fn stalling_keystone_is_bounded_by_the_site_timeout() {
+    let (_guard, record) = record_file();
+    // Keystone accepts the request, then stalls far beyond the site timeout.
+    let mock = mock_with_record(&record, &["--auth-delay", "10"]);
+    let resolver = resolver_for(mock.port, 60, 1); // timeout_secs = 1
+
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), resolver.resolve("multi-nic"))
+        .await
+        .expect("token fetch must be bounded, not hang");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(outcome, Err(ResolveError::DiscoveryUnavailable(_))),
+        "a stalled Keystone must surface as DiscoveryUnavailable, got {outcome:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(5),
+        "bounded by the site timeout (~1s), not the 10s stall: {elapsed:?}"
     );
 }
 

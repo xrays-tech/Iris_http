@@ -40,6 +40,7 @@ class Options:
         self.region: str = args.region
         self.token_ttl: int = args.token_ttl
         self.auth_fail: bool = args.auth_fail
+        self.auth_delay: float = args.auth_delay
         self.servers_status: int | None = args.servers_status
         self.servers_unauthorized_once: bool = args.servers_unauthorized_once
         self.delay: float = args.delay
@@ -108,6 +109,9 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length:
             self.rfile.read(length)  # drain the body
+        if _OPTIONS.auth_delay > 0:
+            # Accept then stall: exercises the client-side auth timeout (FIX #6).
+            time.sleep(_OPTIONS.auth_delay)
         with _STATE_LOCK:
             _AUTH_COUNTER += 1
             token_value = f"mock-token-{_AUTH_COUNTER}"
@@ -182,6 +186,12 @@ def _parse_args(argv) -> argparse.Namespace:
     parser.add_argument("--region", default="RegionOne")
     parser.add_argument("--token-ttl", type=int, default=3600)
     parser.add_argument("--auth-fail", action="store_true", help="return 401 from /v3/auth/tokens")
+    parser.add_argument(
+        "--auth-delay",
+        type=float,
+        default=0.0,
+        help="accept then sleep before replying to /v3/auth/tokens (timeout test)",
+    )
     parser.add_argument("--servers-status", type=int, default=None, help="force a status for /servers")
     parser.add_argument(
         "--servers-unauthorized-once",
