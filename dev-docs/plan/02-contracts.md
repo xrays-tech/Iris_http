@@ -99,7 +99,7 @@ impl SniCertSource {
 //   P4 加 certs；P7 加 firewall/resolvers
 pub struct SharedState { pub config: ArcSwap<Config>, pub routing: ArcSwap<RoutingTable>,
                          pub certs: ArcSwap<SniCertMap>,
-                         pub firewall: ArcSwap<FirewallTable>,
+                         pub firewall: ArcSwap<HashMap<String, Arc<FirewallTable>>>, /* 键=openstack 站点 name；无 firewall_dir 的站点不出现（=不校验，仅 WARN） */
                          pub lbs: ArcSwap<HashMap<String, Arc<LbEngine>>>,
                          pub resolvers: ArcSwap<HashMap<String, Arc<dyn Resolver>>> }
 // src/reload.rs（P8）
