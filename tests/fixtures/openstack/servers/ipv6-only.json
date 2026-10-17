@@ -1,0 +1,14 @@
+{
+  "servers": [
+    {
+      "id": "44444444-4444-4444-4444-444444444444",
+      "name": "ipv6-only",
+      "addresses": {
+        "net-a": [
+          { "version": 6, "addr": "fd00::20", "OS-EXT-IPS:type": "floating" },
+          { "version": 6, "addr": "fd00::10", "OS-EXT-IPS:type": "fixed" }
+        ]
+      }
+    }
+  ]
+}

@@ -33,3 +33,30 @@
 ## 本阶段门禁
 1. 单测全绿 + `cargo build`。
 2. mock 集成用例通过，附输出。
+
+## 实现记录（P5 落地 2026-10）
+
+- **文件**：`src/openstack/{mod,auth,nova,cache}.rs`、`scripts/mock_openstack.py`、
+  `tests/fixtures/openstack/servers/*.json`、`tests/openstack.rs`。
+- **契约**：`Resolver`/`ResolvedInstance`/`ResolveError`/`OpenStackResolver::new|resolve`、
+  `fetch_token(&site.auth, &site.auth.api_url, client)`、`decode_server_list`/`exact_name_match`/
+  `select_address` 均按 `02-contracts.md` 落定。`HttpClient`（`reqwest::Client` 轻包装）定义并导出
+  于 `src/openstack/mod.rs`，供 P7 注入 `Arc<HttpClient>`。
+  - 唯一增量：`Resolver` 增加 `Send + Sync` 超-trait（`SharedState` 的 `Arc<dyn Resolver>` 需要），
+    方法签名不变；`OpenStackResolver::invalidate(&self, instance)` 为新增辅助方法（reload/测试用）。
+- **行为**：`resolve` = 缓存（正向/负 5s / 无地址 1s / 瞬时 1s，±10% jitter）→ 单飞（`watch` 折叠）
+  → 熔断（连续 5 次瞬时失败 open，冷却 `timeout_secs*3`，half-open 探测）→ 认证（token 缓存，提前 60s
+  刷新，Nova 401 单次刷新重试）→ `GET /v2.1/servers?name=&all_tenants=true` → `select_address`
+  （全局 IPv4 优先；floating 优先，fixed 回退；网络名排序保证多 floating 稳定首取）→ 写缓存 +
+  last-known-good（`ArcSwap<HashMap>`，瞬时故障 fail-open）。
+- **依赖**：新增直接依赖 `serde_json = "1"`（`reqwest` 的 `json` 特性已锁定引入 1.0.154，未新增任何
+  crate，`Cargo.lock` 仅把 `serde_json` 列入 iris-http 依赖表）。`decode_server_list(&[u8])` 的字节级
+  JSON 解码必须具名 `serde_json`，属计划 `reqwest json` 的隐含依赖，已在此显式记录。
+- **单测**：`cargo test` 中 openstack 相关 —— 单元 39 例（auth body/解析/catalog/过期、nova 双信封解码/
+  exact_name_match 反前缀/地址矩阵、cache jitter/ttl/熔断状态机、resolver 缓存/单飞/熔断/fail-open/
+  映射）；集成 10 例（mock harness：token 复用、401 单次刷新、空结果/404→NotFound、floating/fixed/IPv6、
+  403/500→DiscoveryUnavailable、控制面宕机无记录→DiscoveryUnavailable、宕机 fail-open last-known-good）。
+- **mock 冒烟**：`python3 scripts/mock_openstack.py --record /tmp/rec.jsonl --servers-dir tests/fixtures/openstack/servers`
+  后 `POST /v3/auth/tokens`→201+`X-Subject-Token`、`GET /v2.1/servers?name=multi-nic&all_tenants=true`→200、
+  未知名→404，`/tmp/rec.jsonl` 记录 `x-auth-token`/`openstack-api-version`。
+

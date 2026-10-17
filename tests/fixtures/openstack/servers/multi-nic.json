@@ -1,0 +1,18 @@
+{
+  "servers": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "name": "multi-nic",
+      "addresses": {
+        "net-a": [
+          { "version": 4, "addr": "192.168.1.10", "OS-EXT-IPS:type": "fixed" },
+          { "version": 4, "addr": "203.0.113.10", "OS-EXT-IPS:type": "floating" },
+          { "version": 6, "addr": "fd00::10", "OS-EXT-IPS:type": "fixed" }
+        ],
+        "net-b": [
+          { "version": 4, "addr": "10.0.0.5", "OS-EXT-IPS:type": "fixed" }
+        ]
+      }
+    }
+  ]
+}

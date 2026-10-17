@@ -1,0 +1,13 @@
+{
+  "servers": [
+    {
+      "id": "22222222-2222-2222-2222-222222222222",
+      "name": "floating-only",
+      "addresses": {
+        "net-a": [
+          { "version": 4, "addr": "203.0.113.11", "OS-EXT-IPS:type": "floating" }
+        ]
+      }
+    }
+  ]
+}

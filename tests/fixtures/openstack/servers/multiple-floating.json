@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "id": "55555555-5555-5555-5555-555555555555",
+      "name": "multiple-floating",
+      "addresses": {
+        "net-b": [
+          { "version": 4, "addr": "203.0.113.10", "OS-EXT-IPS:type": "floating" }
+        ],
+        "net-a": [
+          { "version": 4, "addr": "203.0.113.20", "OS-EXT-IPS:type": "floating" }
+        ]
+      }
+    }
+  ]
+}
