@@ -1,0 +1,11 @@
+name: rr
+mode: forward
+domain: rr.test
+http: true
+https: false
+
+backends:
+  - addr: 127.0.0.1:18081
+  - addr: 127.0.0.1:18082
+
+load_balancer: round_robin

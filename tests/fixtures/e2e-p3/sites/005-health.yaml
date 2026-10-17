@@ -1,0 +1,15 @@
+name: health
+mode: forward
+domain: health.test
+http: true
+https: false
+
+backends:
+  - addr: 127.0.0.1:18081
+  - addr: 127.0.0.1:18082
+
+load_balancer: round_robin
+health_check:
+  kind: tcp
+  interval_secs: 1
+  timeout_secs: 1

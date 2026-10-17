@@ -1,59 +1,44 @@
 //! Iris HTTP binary entry point.
 //!
-//! P0 assembles a minimal Pingora server skeleton (design.md §4.1): a shared
-//! `0.0.0.0:80` HTTP listener. Routing, TLS, load balancing, metrics and
-//! OpenStack discovery arrive in later stages; the placeholder [`ScaffoldProxy`]
-//! therefore rejects every request with 503 rather than pretending to proxy.
+//! P3 assembles the minimal forward-lane server (design.md §4.1): load the site
+//! configuration, compile the routing table and per-site load balancers into a
+//! [`SharedState`], register the [`IrisProxy`] on a shared HTTP listener, and
+//! run until a signal-driven shutdown. TLS/SNI (P4), OpenStack (P5/P7) and
+//! reload (P8) arrive in later stages.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::Context;
-use async_trait::async_trait;
 use clap::Parser;
-use pingora::proxy::{http_proxy_service, ProxyHttp, Session};
+use pingora::proxy::http_proxy_service;
 use pingora::server::configuration::{Opt, ServerConf};
 use pingora::server::Server;
-use pingora::upstreams::peer::HttpPeer;
-use pingora::{Error, ErrorType, Result as PingoraResult};
+use pingora::services::background::background_service;
 
 use iris_http::config::load_config;
+use iris_http::lb::health_check_service;
 use iris_http::logging;
+use iris_http::proxy::IrisProxy;
+use iris_http::routing::RoutingTable;
+use iris_http::state::SharedState;
 use iris_http::{reload, Cli, Command, RunArgs};
 
-/// Address of the shared HTTP listener (design.md §4.1 / D1).
+/// Default address of the shared HTTP listener (design.md §4.1 / D1).
 const HTTP_LISTEN_ADDR: &str = "0.0.0.0:80";
+/// Environment override for the HTTP listener (test/runtime port selection).
+///
+/// The production default is fixed at `0.0.0.0:80`; `config.md` §2 keeps the
+/// port out of the site files, so tests pick an ephemeral port here instead.
+const HTTP_LISTEN_ADDR_ENV: &str = "IRIS_HTTP_LISTEN_ADDR";
 /// Time to let in-flight requests drain on graceful shutdown (design.md §4.1:
 /// `grace_period_seconds`; Pingora otherwise defaults to 5 minutes).
 const GRACE_PERIOD_SECONDS: u64 = 5;
 /// Hard cap on runtime shutdown after the grace period (design.md §4.1:
 /// `graceful_shutdown_timeout_seconds`).
 const GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS: u64 = 10;
-
-/// Placeholder `ProxyHttp` for the P0 skeleton.
-///
-/// It intentionally implements no routing: `upstream_peer` fails with 503 until
-/// P3 wires the real forward/OpenStack logic.
-struct ScaffoldProxy;
-
-#[async_trait]
-impl ProxyHttp for ScaffoldProxy {
-    type CTX = ();
-
-    fn new_ctx(&self) -> Self::CTX {}
-
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        _ctx: &mut Self::CTX,
-    ) -> PingoraResult<Box<HttpPeer>> {
-        Err(Error::explain(
-            ErrorType::HTTPStatus(503),
-            "iris P0 scaffold: no sites configured",
-        ))
-    }
-}
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -76,6 +61,15 @@ fn main() -> ExitCode {
             }
         },
     }
+}
+
+/// Resolve the HTTP listen address, honouring [`HTTP_LISTEN_ADDR_ENV`].
+fn http_listen_addr() -> String {
+    std::env::var(HTTP_LISTEN_ADDR_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| HTTP_LISTEN_ADDR.to_owned())
 }
 
 /// Start the proxy server. Diverges: `run_forever` only returns by exiting the
@@ -104,15 +98,22 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let config = load_config(&sites_dir, &env)
         .map_err(|err| anyhow::anyhow!("failed to load configuration: {err}"))?;
 
+    // Compile the routing table and per-site load balancers into the shared
+    // snapshots read on the request path.
+    let routing = RoutingTable::try_from(&config)
+        .map_err(|err| anyhow::anyhow!("failed to build routing table: {err}"))?;
+    let shared = Arc::new(SharedState::new(config, routing));
+
     if let Some(pidfile) = &args.pidfile {
         write_pidfile(pidfile)?;
     }
 
+    let listen_addr = http_listen_addr();
     tracing::info!(
         config_dir = %args.config_dir.display(),
         sites_dir = %sites_dir.display(),
-        forward_sites = config.forward.len(),
-        openstack_sites = config.openstack.len(),
+        forward_sites = shared.config.load().forward.len(),
+        openstack_sites = shared.config.load().openstack.len(),
         watch_config = args.watch_config,
         version = env!("CARGO_PKG_VERSION"),
         "starting iris"
@@ -121,23 +122,44 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let mut server = build_server()?;
     server.bootstrap();
 
-    let mut proxy_service = http_proxy_service(&server.configuration, ScaffoldProxy);
-    proxy_service.add_tcp(HTTP_LISTEN_ADDR);
+    let app = IrisProxy {
+        shared: Arc::clone(&shared),
+    };
+    let mut proxy_service = http_proxy_service(&server.configuration, app);
+    proxy_service.add_tcp(&listen_addr);
     server.add_service(proxy_service);
+
+    register_health_checks(&mut server, &shared);
 
     // NOTE: the Prometheus service (`pingora_prometheus::prometheus_http_service()`)
     // is confirmed to assemble in `probe_tests::service_assembly_compiles`; it is
-    // not bound here because P0 has no metrics to expose yet and the design's
-    // default port (9090) is commonly occupied during local development. Wiring
-    // lands with the metrics in a later stage (P7/P8).
+    // not bound here because P3 has no metrics to expose yet. Wiring lands with
+    // the metrics in a later stage (P7/P8).
 
-    tracing::info!(
-        http = HTTP_LISTEN_ADDR,
-        "iris skeleton ready; awaiting requests"
-    );
+    tracing::info!(http = %listen_addr, "iris forward lane ready; awaiting requests");
 
     // Never returns; graceful SIGTERM shutdown exits the process with code 0.
     server.run_forever()
+}
+
+/// Register one background health-check service per forward site that
+/// configures `health_check` (`design.md` §4.5).
+fn register_health_checks(server: &mut Server, shared: &Arc<SharedState>) {
+    let config = shared.config.load();
+    for site in &config.forward {
+        let Some(hc) = site.health_check.as_ref() else {
+            continue;
+        };
+        let Some(lb) = shared.lb(&site.name) else {
+            tracing::warn!(site = %site.name, "health_check configured but no load balancer found");
+            continue;
+        };
+        let name = format!("health check {}", site.name);
+        server.add_service(background_service(
+            &name,
+            health_check_service(lb, hc),
+        ));
+    }
 }
 
 /// Build the [`Server`] with the [`ServerConf`] required by design.md §4.1
@@ -163,14 +185,24 @@ mod probe_tests {
     //! `run_forever`).
 
     use super::*;
-    use std::sync::Arc;
 
     use pingora::server::ShutdownWatch;
-    use pingora::services::background::{background_service, BackgroundService};
+    use pingora::services::background::BackgroundService;
+
+    use iris_http::config::Config;
+
+    fn test_shared() -> Arc<SharedState> {
+        let config = Config {
+            forward: Vec::new(),
+            openstack: Vec::new(),
+        };
+        let routing = RoutingTable::try_from(&config).expect("empty routing table builds");
+        Arc::new(SharedState::new(config, routing))
+    }
 
     struct NoopBackground;
 
-    #[async_trait]
+    #[async_trait::async_trait]
     impl BackgroundService for NoopBackground {
         async fn start(&self, mut shutdown: ShutdownWatch) {
             let _ = shutdown.changed().await;
@@ -184,7 +216,10 @@ mod probe_tests {
     fn service_assembly_compiles() {
         let conf = Arc::new(ServerConf::new().expect("default ServerConf"));
 
-        let mut proxy = http_proxy_service(&conf, ScaffoldProxy);
+        let app = IrisProxy {
+            shared: test_shared(),
+        };
+        let mut proxy = http_proxy_service(&conf, app);
         proxy.add_tcp("127.0.0.1:0");
 
         let mut metrics = pingora_prometheus::prometheus_http_service();
@@ -198,7 +233,7 @@ mod probe_tests {
     }
 
     /// Probe #4 / design.md §4.1: `ServerConf` carries the shutdown timing that
-    /// P0 relies on for a prompt, graceful SIGTERM exit.
+    /// P3 relies on for a prompt, graceful SIGTERM exit.
     #[test]
     fn server_conf_sets_version_and_shutdown_timings() {
         let server = build_server().expect("server builds");
@@ -211,5 +246,12 @@ mod probe_tests {
             server.configuration.graceful_shutdown_timeout_seconds,
             Some(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS)
         );
+    }
+
+    #[test]
+    fn http_listen_addr_defaults_when_env_absent() {
+        // `http_listen_addr` must never panic regardless of the ambient env.
+        let addr = http_listen_addr();
+        assert!(!addr.trim().is_empty());
     }
 }

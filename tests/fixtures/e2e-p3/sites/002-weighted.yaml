@@ -1,0 +1,13 @@
+name: weighted
+mode: forward
+domain: weighted.test
+http: true
+https: false
+
+backends:
+  - addr: 127.0.0.1:18081
+    weight: 3
+  - addr: 127.0.0.1:18082
+    weight: 1
+
+load_balancer: weighted_round_robin
