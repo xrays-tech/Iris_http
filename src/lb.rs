@@ -19,14 +19,17 @@
 //! the selector. The attached health check (and every backend's observed
 //! health) therefore survives a membership change.
 //!
-//! Active probing is attached once, at startup, through
-//! [`health_check_service`]: the probe is set on the engine's shared
-//! [`HealthRegistry`] and driven by a [`HealthCheckService`]. Because every
-//! freshly built engine keeps its own registry, a `forward` site whose pool /
-//! algorithm / health spec is *unchanged* across a config reload must reuse its
-//! existing `Arc<LbEngine>` (see `crate::reload`) — otherwise the startup
-//! health-check service would keep probing a stale pool and the new engine
-//! would select down backends again.
+//! # One shared health registry (FIX #2)
+//!
+//! Every forward engine contributes to **one** [`HealthRegistry`] owned by
+//! `SharedState`, driven by a single [`HealthCheckService`]
+//! ([`health_check_service`]). A [`HealthRegistry`] can hold only one probe, so
+//! [`ProbeRegistry`] is that probe: it dispatches each target to the site's
+//! configured probe (TCP/HTTP, path, timeout) and enforces the site's
+//! `interval_secs`. Because the registry is shared and long-lived, a site
+//! added or changed by a reload is gated by the already-running probe service
+//! with no re-attachment step; a site removed by a reload drops its view
+//! (deregistering its targets) when its last `Arc<LbEngine>` is released.
 //!
 //! Backends with `weight == 0` are **fully excluded** from the pool: they are
 //! never added to the Pingora backend set, never selected, and therefore never
@@ -35,13 +38,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use pingora_load_balancing::discovery::ServiceDiscovery;
 use pingora_load_balancing::health_check::{
@@ -54,7 +56,7 @@ use pingora_load_balancing::{
     Backend as PoolBackend, Backends, HealthCheckService, HealthRegistry, LoadBalancer,
 };
 
-use crate::config::{Backend, HealthCheck, HealthKind, LbMode};
+use crate::config::{Backend, Config, HealthCheck, HealthKind, LbMode};
 
 /// Upper bound on the number of candidate backends examined per selection.
 ///
@@ -62,13 +64,20 @@ use crate::config::{Backend, HealthCheck, HealthKind, LbMode};
 /// degenerating when most candidates are unhealthy.
 const SELECT_MAX_ITERATIONS: usize = 100;
 
+/// Cadence of the single shared health-check service.
+///
+/// The service ticks on one fixed cadence; [`ProbeRegistry`] enforces each
+/// site's `interval_secs` by skipping targets whose interval has not elapsed,
+/// so this is only the resolution (and the minimum effective interval).
+pub const HEALTH_CHECK_TICK: Duration = Duration::from_secs(1);
+
 /// A replaceable, in-process backend membership for service discovery.
 ///
 /// Pingora's own `discovery::Static` exposes no way to change its set after
 /// construction (`set` is crate-private), so this provides the single operation
 /// a static YAML reload needs: an atomic membership swap. The [`Backends`] view
-/// that owns it keeps its health registry — and thus its attached probe and the
-/// observed health of every backend — across a replacement.
+/// that owns it keeps its health registry — and thus the observed health of
+/// every backend — across a replacement.
 struct MutableDiscovery {
     backends: ArcSwap<BTreeSet<PoolBackend>>,
 }
@@ -103,22 +112,14 @@ impl ServiceDiscovery for SharedDiscovery {
 /// One load-balancer slot for a concrete selection `S`.
 ///
 /// The `LoadBalancer` is built once and never rebuilt: membership changes go
-/// through [`mutable`](Self::update)'s discovery swap plus
-/// `LoadBalancer::update()`, which is what lets the [`HealthRegistry`] (and the
-/// probe attached to it) outlive a reload.
+/// through [`update`](Self::update)'s discovery swap plus `LoadBalancer::update()`,
+/// which is what lets the shared [`HealthRegistry`] outlive a reload.
 pub struct LbSlot<S>
 where
     S: BackendSelection + 'static,
 {
     lb: LoadBalancer<S>,
     discovery: Arc<MutableDiscovery>,
-    /// The registry the `LoadBalancer`'s `Backends` view contributes targets to
-    /// and reads readiness from. Shared so [`health_check_service`] can attach
-    /// the probe and drive it without touching the `LoadBalancer`.
-    registry: Arc<HealthRegistry>,
-    /// The installed health-check spec, if any. Guards the one-shot probe
-    /// install (`HealthRegistry::set_health_check` may only be called once).
-    health: OnceLock<HealthCheck>,
 }
 
 impl<S> LbSlot<S>
@@ -126,17 +127,16 @@ where
     S: BackendSelection + Send + Sync + 'static,
     S::Iter: BackendIter,
 {
-    fn new(backends: &[Backend]) -> Self {
+    fn new(backends: &[Backend], registry: Arc<HealthRegistry>) -> Self {
         let discovery = MutableDiscovery::new(pool_set(backends));
-        let registry = Arc::new(HealthRegistry::new());
 
         // A shared-registry view: this `LoadBalancer` does not schedule its own
-        // probes (`Backends::owns_health_checks` is false); the probe attached
-        // later to `registry` is driven by the `HealthCheckService` returned
-        // from `health_check_service`.
+        // probes (`Backends::owns_health_checks` is false); the single
+        // `HealthCheckService` drives the shared registry instead. The view owns
+        // the registry `Arc`, so it stays alive as long as the engine does.
         let view = Backends::new_with_health_registry(
             Box::new(SharedDiscovery(Arc::clone(&discovery))),
-            Arc::clone(&registry),
+            registry,
         );
 
         let mut lb = LoadBalancer::<S>::from_backends(view);
@@ -146,12 +146,7 @@ where
 
         prime::<S>(&lb);
 
-        Self {
-            lb,
-            discovery,
-            registry,
-            health: OnceLock::new(),
-        }
+        Self { lb, discovery }
     }
 
     /// Select a backend for `key`. `key` is only meaningful for consistent
@@ -166,8 +161,8 @@ where
     ///
     /// The member set is swapped in place through the shared discovery and the
     /// selector is rebuilt against the *same* `Backends`/`HealthRegistry`, so
-    /// the attached health probe and the observed health of the retained
-    /// backends are preserved.
+    /// the shared probe and the observed health of the retained backends are
+    /// preserved.
     fn update(&self, backends: &[Backend]) {
         self.discovery.replace(pool_set(backends));
         match poll_once(self.lb.update()) {
@@ -180,33 +175,6 @@ where
                 "forward load balancer membership update did not complete synchronously"
             ),
         }
-    }
-
-    /// Install the health-check probe on this slot's shared registry.
-    ///
-    /// Installed at most once (a registry accepts a single probe); later calls
-    /// are ignored, matching the "attach once at startup" contract.
-    fn install_health_check(&self, hc: &HealthCheck) {
-        if self.health.set(hc.clone()).is_ok() {
-            self.registry.set_health_check(build_probe(hc));
-        }
-    }
-
-    /// Run the active health-check loop for this slot's registry until
-    /// `shutdown`.
-    async fn run(&self, shutdown: ShutdownWatch) {
-        let mut service = HealthCheckService::new(Arc::clone(&self.registry));
-        service.health_check_frequency = self
-            .health
-            .get()
-            .map(|hc| Duration::from_secs(hc.interval_secs.max(1)));
-        service.start(shutdown).await;
-    }
-
-    /// The shared health registry (test seam: proves `update` keeps it).
-    #[cfg(test)]
-    pub(crate) fn health_registry(&self) -> Arc<HealthRegistry> {
-        Arc::clone(&self.registry)
     }
 }
 
@@ -235,11 +203,7 @@ impl LbEngine {
         }
     }
 
-    /// Replace the backend pool, preserving the algorithm and health check.
-    ///
-    /// Membership is refreshed against the engine's existing `Backends`, so an
-    /// attached health-check probe (and the observed health of every retained
-    /// backend) keeps working across the update.
+    /// Replace the backend pool, preserving the algorithm and health state.
     pub fn update(&self, backends: &[Backend]) {
         match self {
             LbEngine::RR(slot) => slot.update(backends),
@@ -247,42 +211,22 @@ impl LbEngine {
             LbEngine::Ketama(slot) => slot.update(backends),
         }
     }
-
-    fn install_health_check(&self, hc: &HealthCheck) {
-        match self {
-            LbEngine::RR(slot) => slot.install_health_check(hc),
-            LbEngine::Random(slot) => slot.install_health_check(hc),
-            LbEngine::Ketama(slot) => slot.install_health_check(hc),
-        }
-    }
-
-    async fn run(&self, shutdown: ShutdownWatch) {
-        match self {
-            LbEngine::RR(slot) => slot.run(shutdown).await,
-            LbEngine::Random(slot) => slot.run(shutdown).await,
-            LbEngine::Ketama(slot) => slot.run(shutdown).await,
-        }
-    }
-
-    /// The shared health registry of this engine (test seam).
-    #[cfg(test)]
-    pub(crate) fn health_registry(&self) -> Arc<HealthRegistry> {
-        match self {
-            LbEngine::RR(slot) => slot.health_registry(),
-            LbEngine::Random(slot) => slot.health_registry(),
-            LbEngine::Ketama(slot) => slot.health_registry(),
-        }
-    }
 }
 
-/// Build an engine for `backends` under `mode`.
+/// Build an engine for `backends` under `mode`, contributing to `registry`.
 ///
 /// `weight == 0` backends are dropped here (and by [`enabled_backends`]).
-pub fn build_lb(backends: &[Backend], mode: &LbMode) -> Arc<LbEngine> {
+pub fn build_lb(
+    backends: &[Backend],
+    mode: &LbMode,
+    registry: &Arc<HealthRegistry>,
+) -> Arc<LbEngine> {
     let engine = match mode {
-        LbMode::RoundRobin | LbMode::WeightedRoundRobin => LbEngine::RR(LbSlot::new(backends)),
-        LbMode::Random => LbEngine::Random(LbSlot::new(backends)),
-        LbMode::Ketama => LbEngine::Ketama(LbSlot::new(backends)),
+        LbMode::RoundRobin | LbMode::WeightedRoundRobin => {
+            LbEngine::RR(LbSlot::new(backends, Arc::clone(registry)))
+        }
+        LbMode::Random => LbEngine::Random(LbSlot::new(backends, Arc::clone(registry))),
+        LbMode::Ketama => LbEngine::Ketama(LbSlot::new(backends, Arc::clone(registry))),
     };
     Arc::new(engine)
 }
@@ -292,29 +236,183 @@ pub fn enabled_backends(backends: &[Backend]) -> Vec<Backend> {
     backends.iter().filter(|b| b.weight > 0).cloned().collect()
 }
 
-/// Attach an active health check to `lb` and return the background service
-/// that runs it.
+/// Build the background service that drives the shared forward health registry.
 ///
-/// The probe is installed once on the engine's shared health registry; failed
-/// backends are excluded from [`LbEngine::select`] and recover automatically
-/// once they pass again. Because the probe lives on the engine's own registry,
-/// the reload path must reuse an unchanged site's `Arc<LbEngine>` (keeping this
-/// service pointed at the same pool) — see `crate::reload::apply_new_config`.
-pub fn health_check_service(lb: Arc<LbEngine>, hc: &HealthCheck) -> impl BackgroundService {
-    lb.install_health_check(hc);
-    LbHealthService { engine: lb }
+/// One service covers every forward site, so sites added or changed by a reload
+/// are gated without a per-site service (FIX #2). The registry must have a probe
+/// configured before this service starts; [`ProbeRegistry`] is that probe.
+pub fn health_check_service(registry: Arc<HealthRegistry>) -> impl BackgroundService {
+    let mut service = HealthCheckService::new(registry);
+    service.health_check_frequency = Some(HEALTH_CHECK_TICK);
+    service
 }
 
-/// Background service wrapper around an [`LbEngine`]'s active probing.
-struct LbHealthService {
-    engine: Arc<LbEngine>,
+// ---------------------------------------------------------------------------
+// ProbeRegistry: the single dispatching probe behind the shared registry.
+// ---------------------------------------------------------------------------
+
+/// The process-wide active-probe dispatcher shared by every forward engine.
+///
+/// A [`HealthRegistry`] holds a single probe, so this implements
+/// [`HealthCheckProbe`] and routes each target to a per-site probe built from
+/// the site's [`HealthCheck`] spec, enforcing each site's `interval_secs`
+/// against the shared service's fixed tick. [`sync`](Self::sync) rebuilds the
+/// target table from a [`Config`] on startup and after every successful reload;
+/// a target with no spec is left healthy (the site configured no health check).
+pub struct ProbeRegistry {
+    slots: Mutex<HashMap<u64, Arc<ProbeSlot>>>,
 }
+
+/// One target's probe plus its interval bookkeeping.
+struct ProbeSlot {
+    spec: HealthCheck,
+    probe: Box<dyn HealthCheckProbe + Send + Sync>,
+    timing: Mutex<ProbeTiming>,
+}
+
+/// The last observed result and when it was taken (guards the per-site interval).
+struct ProbeTiming {
+    last: Option<(bool, Instant)>,
+}
+
+impl ProbeSlot {
+    fn new(spec: HealthCheck) -> Self {
+        let probe = build_probe(&spec);
+        Self {
+            spec,
+            probe,
+            timing: Mutex::new(ProbeTiming { last: None }),
+        }
+    }
+
+    fn interval(&self) -> Duration {
+        Duration::from_secs(self.spec.interval_secs.max(1))
+    }
+
+    /// Whether `interval_secs` has elapsed since the last observation (or the
+    /// target has never been observed).
+    fn is_due(&self) -> bool {
+        let timing = lock(&self.timing);
+        match timing.last {
+            None => true,
+            Some((_, at)) => at.elapsed() >= self.interval(),
+        }
+    }
+
+    /// The last observed health, if the target was ever checked.
+    fn last_health(&self) -> Option<bool> {
+        lock(&self.timing).last.map(|(healthy, _)| healthy)
+    }
+
+    fn record(&self, healthy: bool) {
+        lock(&self.timing).last = Some((healthy, Instant::now()));
+    }
+}
+
+impl ProbeRegistry {
+    /// Create an empty probe registry.
+    pub fn new() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Rebuild the target table from `config`.
+    ///
+    /// Only `forward` sites with a `health_check` contribute; a target whose
+    /// spec is unchanged keeps its previous slot (and observed health). Targets
+    /// absent from `config` are dropped, so a site/health-check removed by a
+    /// reload stops being probed (FIX #8).
+    pub fn sync(&self, config: &Config) {
+        let mut slots = lock(&self.slots);
+        let mut next: HashMap<u64, Arc<ProbeSlot>> = HashMap::with_capacity(slots.len());
+        for site in &config.forward {
+            let Some(hc) = site.health_check.as_ref() else {
+                continue;
+            };
+            for backend in enabled_backends(&site.backends) {
+                let Some(pool) = pool_backend(&backend) else {
+                    continue;
+                };
+                let key = backend_key(&pool);
+                let slot = match slots.get(&key) {
+                    Some(existing) if existing.spec == *hc => Arc::clone(existing),
+                    _ => Arc::new(ProbeSlot::new(hc.clone())),
+                };
+                next.insert(key, slot);
+            }
+        }
+        *slots = next;
+    }
+
+    /// Number of probed targets (test seam).
+    #[cfg(test)]
+    pub(crate) fn slot_count(&self) -> usize {
+        lock(&self.slots).len()
+    }
+}
+
+impl Default for ProbeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The boxed [`HealthCheckProbe`] handed to the shared registry; delegates to a
+/// shared [`ProbeRegistry`].
+pub struct SharedProbe(pub Arc<ProbeRegistry>);
 
 #[async_trait]
-impl BackgroundService for LbHealthService {
-    async fn start(&self, shutdown: ShutdownWatch) {
-        self.engine.run(shutdown).await;
+impl HealthCheckProbe for SharedProbe {
+    async fn check(&self, target: &PoolBackend) -> pingora::Result<()> {
+        let key = backend_key(target);
+        let slot = {
+            let slots = lock(&self.0.slots);
+            slots.get(&key).cloned()
+        };
+        let Some(slot) = slot else {
+            // No health check configured for this target: leave it healthy.
+            return Ok(());
+        };
+
+        if !slot.is_due() {
+            // Repeat the last result so an intermediate registry pass cannot
+            // flip a not-yet-rechecked target back to healthy.
+            return match slot.last_health() {
+                Some(false) => Err(pingora::Error::explain(
+                    pingora::ErrorType::InternalError,
+                    "cached unhealthy: health-check interval has not elapsed",
+                )),
+                _ => Ok(()),
+            };
+        }
+
+        let result = slot.probe.check(target).await;
+        slot.record(result.is_ok());
+        result
     }
+
+    fn health_threshold(&self, _success: bool) -> usize {
+        // The built-in TCP/HTTP probes use a threshold of one; the dispatcher
+        // aggregates targets that all do.
+        1
+    }
+}
+
+/// Lock a mutex, recovering from poisoning (the guarded data is plain state).
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A stable key for a pool backend (mirrors the registry's own identity: addr +
+/// weight; `ext` is ignored by `Backend`'s `Hash`).
+fn backend_key(backend: &PoolBackend) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    backend.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Pure health-transition state machine (proxy-side observation helper).
@@ -427,6 +525,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::config::{ForwardSite, OpenStackSite};
+
     fn backend(port: u16, weight: u32) -> Backend {
         Backend {
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
@@ -447,25 +547,51 @@ mod tests {
         }
     }
 
+    /// An engine with its own throwaway registry (selection-only tests).
+    fn engine(backends: &[Backend], mode: &LbMode) -> Arc<LbEngine> {
+        build_lb(backends, mode, &Arc::new(HealthRegistry::new()))
+    }
+
+    fn forward_site(name: &str, backends: Vec<Backend>, health_check: Option<HealthCheck>) -> ForwardSite {
+        ForwardSite {
+            name: name.to_owned(),
+            domain: format!("{name}.example.com"),
+            http: true,
+            https: false,
+            cert_file: None,
+            key_file: None,
+            backends,
+            lb_mode: LbMode::RoundRobin,
+            health_check,
+        }
+    }
+
+    fn config(forward: Vec<ForwardSite>) -> Config {
+        Config {
+            forward,
+            openstack: Vec::<OpenStackSite>::new(),
+        }
+    }
+
     // ----- LbMode -> selection mapping -----
 
     #[test]
     fn lb_mode_maps_to_engine_variant() {
         let backends = [backend(1, 1)];
         assert!(matches!(
-            *build_lb(&backends, &LbMode::RoundRobin),
+            *engine(&backends, &LbMode::RoundRobin),
             LbEngine::RR(_)
         ));
         assert!(matches!(
-            *build_lb(&backends, &LbMode::WeightedRoundRobin),
+            *engine(&backends, &LbMode::WeightedRoundRobin),
             LbEngine::RR(_)
         ));
         assert!(matches!(
-            *build_lb(&backends, &LbMode::Random),
+            *engine(&backends, &LbMode::Random),
             LbEngine::Random(_)
         ));
         assert!(matches!(
-            *build_lb(&backends, &LbMode::Ketama),
+            *engine(&backends, &LbMode::Ketama),
             LbEngine::Ketama(_)
         ));
     }
@@ -484,7 +610,7 @@ mod tests {
     #[test]
     fn weight_zero_backend_is_never_selected() {
         let backends = [backend(1, 1), backend(2, 0)];
-        let lb = build_lb(&backends, &LbMode::RoundRobin);
+        let lb = engine(&backends, &LbMode::RoundRobin);
         for _ in 0..10 {
             let selected = lb.select(None);
             assert_eq!(selected, Some(addr(1)));
@@ -493,7 +619,7 @@ mod tests {
 
     #[test]
     fn empty_pool_selects_none() {
-        let lb = build_lb(&[], &LbMode::RoundRobin);
+        let lb = engine(&[], &LbMode::RoundRobin);
         assert_eq!(lb.select(None), None);
     }
 
@@ -502,7 +628,7 @@ mod tests {
     #[test]
     fn round_robin_alternates() {
         let backends = [backend(1, 1), backend(2, 1)];
-        let lb = build_lb(&backends, &LbMode::RoundRobin);
+        let lb = engine(&backends, &LbMode::RoundRobin);
         let seen: Vec<Option<SocketAddr>> = (0..4).map(|_| lb.select(None)).collect();
         assert_eq!(
             seen,
@@ -514,7 +640,7 @@ mod tests {
     fn weighted_round_robin_honours_weights() {
         // weight 3 : 1 -> three picks of the heavy backend, then one of the light.
         let backends = [backend(1, 3), backend(2, 1)];
-        let lb = build_lb(&backends, &LbMode::WeightedRoundRobin);
+        let lb = engine(&backends, &LbMode::WeightedRoundRobin);
         let mut counts: HashMap<SocketAddr, usize> = HashMap::new();
         for _ in 0..8 {
             if let Some(selected) = lb.select(None) {
@@ -528,7 +654,7 @@ mod tests {
     #[test]
     fn random_selects_a_configured_backend() {
         let backends = [backend(1, 1), backend(2, 1)];
-        let lb = build_lb(&backends, &LbMode::Random);
+        let lb = engine(&backends, &LbMode::Random);
         for _ in 0..50 {
             let selected = lb.select(None);
             assert!(selected == Some(addr(1)) || selected == Some(addr(2)));
@@ -538,7 +664,7 @@ mod tests {
     #[test]
     fn ketama_is_stable_for_a_given_client() {
         let backends = [backend(1, 1), backend(2, 1)];
-        let lb = build_lb(&backends, &LbMode::Ketama);
+        let lb = engine(&backends, &LbMode::Ketama);
         let client = IpAddr::from([203, 0, 113, 7]);
         let first = lb.select(Some(client));
         assert!(first.is_some());
@@ -551,7 +677,7 @@ mod tests {
 
     #[test]
     fn update_swaps_the_backend_pool() {
-        let lb = build_lb(&[backend(1, 1)], &LbMode::RoundRobin);
+        let lb = engine(&[backend(1, 1)], &LbMode::RoundRobin);
         assert_eq!(lb.select(None), Some(addr(1)));
         lb.update(&[backend(9, 1)]);
         assert_eq!(lb.select(None), Some(addr(9)));
@@ -559,49 +685,87 @@ mod tests {
 
     #[test]
     fn update_drops_weight_zero_backends() {
-        let lb = build_lb(&[backend(1, 1)], &LbMode::RoundRobin);
+        let lb = engine(&[backend(1, 1)], &LbMode::RoundRobin);
         lb.update(&[backend(1, 0), backend(2, 1)]);
         for _ in 0..4 {
             assert_eq!(lb.select(None), Some(addr(2)));
         }
     }
 
-    #[test]
-    fn update_preserves_the_health_registry() {
-        let lb = build_lb(&[backend(1, 1), backend(2, 1)], &LbMode::RoundRobin);
-        lb.install_health_check(&tcp_health());
+    // ----- shared registry (FIX #2) -----
 
-        let registry = lb.health_registry();
+    #[test]
+    fn fresh_engine_registers_into_the_shared_registry() {
+        let registry = Arc::new(HealthRegistry::new());
+        assert_eq!(registry.target_count(), 0);
+
+        let _lb = build_lb(&[backend(1, 1), backend(2, 1)], &LbMode::RoundRobin, &registry);
+
         assert_eq!(
             registry.target_count(),
             2,
-            "the probe registry must see the primed pool"
+            "a freshly built engine must contribute its targets to the shared registry"
+        );
+    }
+
+    #[test]
+    fn update_preserves_the_health_registry() {
+        let registry = Arc::new(HealthRegistry::new());
+        let lb = build_lb(
+            &[backend(1, 1), backend(2, 1)],
+            &LbMode::RoundRobin,
+            &registry,
+        );
+
+        assert_eq!(
+            registry.target_count(),
+            2,
+            "the shared registry must see the primed pool"
         );
 
         lb.update(&[backend(9, 1)]);
 
-        let after = lb.health_registry();
-        assert!(
-            Arc::ptr_eq(&registry, &after),
-            "update must keep the same health registry, so the attached probe survives"
-        );
         assert_eq!(
-            after.target_count(),
+            registry.target_count(),
             1,
-            "the membership refresh must reach the shared registry"
+            "the membership refresh must reach the same shared registry"
         );
         assert_eq!(lb.select(None), Some(addr(9)));
     }
 
+    // ----- ProbeRegistry -----
+
     #[test]
-    fn install_health_check_is_idempotent() {
-        // A registry accepts a single probe; a second install must be a no-op
-        // rather than a panic.
-        let lb = build_lb(&[backend(1, 1)], &LbMode::RoundRobin);
-        let hc = tcp_health();
-        lb.install_health_check(&hc);
-        lb.install_health_check(&hc);
-        assert_eq!(lb.select(None), Some(addr(1)));
+    fn probe_registry_tracks_only_health_checked_sites() {
+        let probes = ProbeRegistry::new();
+        probes.sync(&config(vec![
+            forward_site("plain", vec![backend(1, 1)], None),
+            forward_site(
+                "gated",
+                vec![backend(2, 1), backend(3, 0)],
+                Some(tcp_health()),
+            ),
+        ]));
+        // Only `gated`'s single enabled backend is probed.
+        assert_eq!(probes.slot_count(), 1);
+    }
+
+    #[test]
+    fn probe_registry_sync_is_idempotent_and_drops_removed_sites() {
+        let probes = ProbeRegistry::new();
+        let gated = || forward_site("gated", vec![backend(2, 1)], Some(tcp_health()));
+
+        probes.sync(&config(vec![gated()]));
+        let key_len = probes.slot_count();
+        assert_eq!(key_len, 1);
+
+        // Re-syncing the same spec must not add slots.
+        probes.sync(&config(vec![gated()]));
+        assert_eq!(probes.slot_count(), 1);
+
+        // Removing the site (or its health check) drops its probe (FIX #8).
+        probes.sync(&config(vec![forward_site("gated", vec![backend(2, 1)], None)]));
+        assert_eq!(probes.slot_count(), 0);
     }
 
     // ----- pure health state machine -----

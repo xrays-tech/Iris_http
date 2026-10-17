@@ -3,15 +3,15 @@
 //!
 //! [`apply_new_config`] implements the *validate-first, keep-old-on-fail* hot
 //! swap (`reload.md` §2): every component of the new configuration is built
-//! before **any** live field is touched; a build error returns [`ReloadError`]
-//! and leaves the running configuration serving unchanged. Only after every
-//! build succeeds are the [`crate::state::SharedState`] `ArcSwap` fields
-//! committed with an atomic per-field `store`.
+//! before **any** live state is touched; a build error returns [`ReloadError`]
+//! and leaves the running configuration serving unchanged. Once every build
+//! succeeds it publishes one new [`Snapshot`] with a single atomic
+//! [`SharedState::store`], so a request observes either the whole old
+//! configuration or the whole new one — never a half-applied mixture (FIX #3).
 //!
-//! The commit is not atomic *across* fields (each field's `ArcSwap::store` is
-//! atomic on its own). This is safe because in-flight requests hold the `Arc`
-//! snapshot they already loaded: a request either observes the whole old
-//! snapshot or the whole new one per field, never a half-built value.
+//! The forward [`HealthRegistry`](pingora_load_balancing::HealthRegistry) and
+//! its dispatching probe are shared across reloads (FIX #2): a site added or
+//! changed by a reload is gated by the already-running health-check service.
 //!
 //! [`ReloadService`] is the [`BackgroundService`] that owns the trigger loop:
 //! it selects on a tokio `SIGHUP` stream (`iris reload` sends `SIGHUP`),
@@ -34,7 +34,7 @@ use crate::firewall::{build_firewall, FirewallTable};
 use crate::lb::{build_lb, LbEngine};
 use crate::openstack::{HttpClient, OpenStackResolver, Resolver};
 use crate::routing::RoutingTable;
-use crate::state::SharedState;
+use crate::state::{SharedState, Snapshot};
 use crate::tls::SniCertMap;
 
 /// Interval between configuration re-scans when `--watch-config` is enabled.
@@ -85,16 +85,29 @@ impl std::error::Error for ReloadError {}
 /// A stable fingerprint of a loaded [`Config`]'s contents.
 ///
 /// The fingerprint is a hex-encoded 64-bit hash of the configuration's
-/// canonical `Debug` rendering (which is deterministic for a given load order
-/// and never renders credential material, `config.rs`). It is exposed by
-/// `/version` so an operator can confirm a `reload` took effect, and is used by
-/// `--watch-config` to skip re-applying an unchanged configuration.
+/// canonical rendering **including credential material** (FIX #4): the
+/// redacting `Debug` rendering covers every non-secret field, and each
+/// credential's real secret is hashed separately so a credential-only rotation
+/// changes the fingerprint (and is therefore applied by `--watch-config`). Only
+/// the hash is exposed (by `/version`), never the secrets.
 pub fn config_fingerprint(config: &Config) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
+    use crate::config::AuthCredentials;
+
     let mut hasher = DefaultHasher::new();
+    // `Debug` is deterministic for a fixed field order and renders every
+    // non-secret field (secrets are redacted, so they are added explicitly next).
     format!("{config:?}").hash(&mut hasher);
+    // The redacted secret fields, hashed in load order.
+    for site in &config.openstack {
+        site.name.hash(&mut hasher);
+        match &site.openstack.auth.credentials {
+            AuthCredentials::Password { password, .. } => password.hash(&mut hasher),
+            AuthCredentials::ApplicationCredential { secret, .. } => secret.hash(&mut hasher),
+        }
+    }
     format!("{:016x}", hasher.finish())
 }
 
@@ -105,13 +118,14 @@ pub fn config_fingerprint(config: &Config) -> String {
 /// 1. **Build phase** — the routing table, per-site firewall tables, per-SNI
 ///    certificate map, the forward load-balancer map and the openstack resolver
 ///    map are all constructed first. A failure at any step returns
-///    [`ReloadError`] and **no live field is modified**.
-/// 2. **Commit phase** — every `ArcSwap` field is replaced with a single atomic
-///    `store`. OpenStack resolvers whose `openstack` config is unchanged are
-///    *reused* (same `Arc`) so their in-process cache survives the reload,
-///    avoiding a discovery stampede (`reload.md` §3 "缓存保留防击穿").
+///    [`ReloadError`] and **no live state is modified**.
+/// 2. **Commit phase** — one [`Snapshot`] is published with a single atomic
+///    `store` (FIX #3). OpenStack resolvers whose `openstack` config is
+///    unchanged and forward engines whose pool/algorithm/health spec is
+///    unchanged are *reused* (same `Arc`), so the resolver cache survives and
+///    the shared health probe keeps gating both (`reload.md` §3).
 pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadError> {
-    // ---- build phase: nothing below touches a live field ----
+    // ---- build phase: nothing below touches live state ----
     let routing = RoutingTable::try_from(&cfg)
         .map_err(|err| ReloadError::build("routing", err.to_string()))?;
 
@@ -131,31 +145,30 @@ pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadEr
     let certs = SniCertMap::from_sites(&cfg)
         .map_err(|err| ReloadError::build("certificates", format!("{err:#}")))?;
 
-    // The live config snapshot, used to decide what can be reused below. Held
-    // for the whole build phase (it is only an `Arc` snapshot).
-    let old_config = state.config.load();
+    // The live snapshot, used to decide what can be reused below and to carry
+    // the shared health registry forward. Held for the whole build phase.
+    let old = state.snapshot();
 
     // Forward load balancers: reuse the live engine for a forward site whose
     // *pool-relevant* configuration (backends, algorithm, health check) is
-    // unchanged. The startup health-check service holds this exact
-    // `Arc<LbEngine>`, so reusing it keeps the attached probe gating selection
-    // after the reload; only a genuinely changed site gets a fresh engine (with
-    // a probe re-attached the same way startup does).
+    // unchanged. The engine shares the process-wide health registry, so even a
+    // rebuilt engine is gated by the already-running probe; reuse additionally
+    // keeps the observed health history across the reload.
     let mut lbs: HashMap<String, Arc<LbEngine>> = HashMap::with_capacity(cfg.forward.len());
     for site in &cfg.forward {
-        let unchanged = old_config.forward.iter().any(|old| {
-            old.name == site.name
-                && old.backends == site.backends
-                && old.lb_mode == site.lb_mode
-                && old.health_check == site.health_check
+        let unchanged = old.config.forward.iter().any(|old_site| {
+            old_site.name == site.name
+                && old_site.backends == site.backends
+                && old_site.lb_mode == site.lb_mode
+                && old_site.health_check == site.health_check
         });
         let engine = if unchanged {
-            match state.lb(&site.name) {
-                Some(existing) => existing,
-                None => build_lb(&site.backends, &site.lb_mode),
+            match old.lbs.get(&site.name) {
+                Some(existing) => Arc::clone(existing),
+                None => build_lb(&site.backends, &site.lb_mode, &old.registry),
             }
         } else {
-            build_lb(&site.backends, &site.lb_mode)
+            build_lb(&site.backends, &site.lb_mode, &old.registry)
         };
         lbs.insert(site.name.clone(), engine);
     }
@@ -166,13 +179,14 @@ pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadEr
     let mut resolvers: HashMap<String, Arc<dyn Resolver>> =
         HashMap::with_capacity(cfg.openstack.len());
     for site in &cfg.openstack {
-        let unchanged = old_config
+        let unchanged = old
+            .config
             .openstack
             .iter()
-            .any(|old| old.name == site.name && old.openstack == site.openstack);
+            .any(|old_site| old_site.name == site.name && old_site.openstack == site.openstack);
         let resolver: Arc<dyn Resolver> = if unchanged {
-            match state.resolver_for(&site.name) {
-                Some(existing) => existing,
+            match old.resolvers.get(&site.name) {
+                Some(existing) => Arc::clone(existing),
                 None => Arc::new(OpenStackResolver::new(&site.openstack, Arc::clone(&client))),
             }
         } else {
@@ -180,16 +194,24 @@ pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadEr
         };
         resolvers.insert(site.name.clone(), resolver);
     }
-    drop(old_config);
+
+    // Re-point the shared probe at the new site/health specs. Targets of removed
+    // or health-check-less sites stop being probed (FIX #8); the engine views
+    // deregister their membership when their last `Arc<LbEngine>` is released.
+    state.probes().sync(&cfg);
 
     // ---- commit phase: every build above succeeded ----
-    state.routing.store(Arc::new(routing));
-    state.firewall.store(Arc::new(firewall));
-    state.resolvers.store(Arc::new(resolvers));
-    state.certs.store(Arc::new(certs));
-    state.lbs.store(Arc::new(lbs));
-    state.config.store(Arc::new(cfg));
-    state.fingerprint.store(Arc::new(fingerprint));
+    let snapshot = Snapshot {
+        config: Arc::new(cfg),
+        routing: Arc::new(routing),
+        lbs: Arc::new(lbs),
+        certs: Arc::new(certs),
+        firewall: Arc::new(firewall),
+        resolvers: Arc::new(resolvers),
+        registry: Arc::clone(&old.registry),
+        fingerprint: Arc::new(fingerprint),
+    };
+    state.store(snapshot);
     Ok(())
 }
 
@@ -317,7 +339,7 @@ impl ReloadService {
         };
 
         let fingerprint = config_fingerprint(&cfg);
-        let current = self.state.fingerprint.load_full();
+        let current = self.state.fingerprint();
         if !force && fingerprint.as_str() == current.as_str() {
             return false;
         }
@@ -325,7 +347,7 @@ impl ReloadService {
         match apply_new_config(&self.state, cfg) {
             Ok(()) => {
                 record_config_reload(true);
-                let applied = self.state.fingerprint.load_full();
+                let applied = self.state.fingerprint();
                 tracing::info!(
                     fingerprint = %applied.as_str(),
                     previous = %current.as_str(),
@@ -523,21 +545,47 @@ mod tests {
         assert_ne!(one, config_fingerprint(&tweaked));
     }
 
+    #[test]
+    fn credential_rotation_changes_the_fingerprint_but_not_debug() {
+        let a = config_a();
+        let mut b = config_a();
+        match &mut b.openstack[0].openstack.auth.credentials {
+            AuthCredentials::ApplicationCredential { secret, .. } => {
+                *secret = "rotated-secret".to_owned();
+            }
+            other => panic!("expected an application credential, got {other:?}"),
+        }
+
+        // The redacting Debug cannot see the secret...
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "Debug must redact the secret so the two renderings are identical"
+        );
+        // ...but the fingerprint must, so --watch-config applies a rotation.
+        assert_ne!(
+            config_fingerprint(&a),
+            config_fingerprint(&b),
+            "a credential-only rotation must change the fingerprint"
+        );
+        assert_eq!(config_fingerprint(&a), config_fingerprint(&config_a()));
+    }
+
     // ----- apply_new_config: success -----
 
     #[test]
     fn apply_rebuilds_and_swaps_every_field() {
         let state = own_state(config_a());
-        let before_fp = state.fingerprint.load_full();
+        let before_fp = state.fingerprint();
 
         apply_new_config(&state, config_b()).expect("valid config applies");
 
         // config + fingerprint
-        assert_eq!(state.config.load().forward.len(), 2);
-        assert_ne!(state.fingerprint.load_full().as_str(), before_fp.as_str());
+        assert_eq!(state.config().forward.len(), 2);
+        assert_ne!(state.fingerprint().as_str(), before_fp.as_str());
 
         // routing table sees the new site
-        assert!(state.routing.load().lookup("api.example.com").is_some());
+        assert!(state.snapshot().routing.lookup("api.example.com").is_some());
 
         // lbs map rebuilt and selects the new backend
         assert!(state.lb("api").is_some());
@@ -554,11 +602,11 @@ mod tests {
     fn apply_is_idempotent() {
         let state = own_state(config_a());
         apply_new_config(&state, config_b()).expect("first apply");
-        let fp = state.fingerprint.load_full();
+        let fp = state.fingerprint();
         let weighted = state.lb("www").expect("www lb").select(None);
 
         apply_new_config(&state, config_b()).expect("second apply");
-        assert_eq!(state.fingerprint.load_full().as_str(), fp.as_str());
+        assert_eq!(state.fingerprint().as_str(), fp.as_str());
         assert_eq!(
             state.lb("www").expect("www lb").select(None),
             weighted,
@@ -568,20 +616,10 @@ mod tests {
 
     // ----- apply_new_config: failure keeps old -----
 
-    fn snapshot(state: &SharedState) -> (Arc<Config>, Arc<RoutingTable>) {
-        (state.config.load_full(), state.routing.load_full())
-    }
-
     #[test]
     fn build_failure_leaves_every_field_untouched() {
         let state = own_state(config_a());
-        let config_before = state.config.load_full();
-        let routing_before = state.routing.load_full();
-        let lbs_before = state.lbs.load_full();
-        let firewall_before = state.firewall.load_full();
-        let resolvers_before = state.resolvers.load_full();
-        let certs_before = state.certs.load_full();
-        let fp_before = state.fingerprint.load_full();
+        let snapshot_before = state.snapshot();
 
         // An https forward site whose certificate cannot be loaded fails the
         // certificate build (validate-first: the whole reload is rejected).
@@ -604,20 +642,18 @@ mod tests {
         let err = apply_new_config(&state, bad).expect_err("bad cert must reject the reload");
         assert!(matches!(err, ReloadError::Build { component, .. } if component == "certificates"));
 
-        assert!(Arc::ptr_eq(&config_before, &state.config.load_full()));
-        assert!(Arc::ptr_eq(&routing_before, &state.routing.load_full()));
-        assert!(Arc::ptr_eq(&lbs_before, &state.lbs.load_full()));
-        assert!(Arc::ptr_eq(&firewall_before, &state.firewall.load_full()));
-        assert!(Arc::ptr_eq(&resolvers_before, &state.resolvers.load_full()));
-        assert!(Arc::ptr_eq(&certs_before, &state.certs.load_full()));
-        assert_eq!(state.fingerprint.load_full().as_str(), fp_before.as_str());
+        // One atomic snapshot: a rejected reload leaves the exact same snapshot
+        // published (FIX #3).
+        assert!(
+            Arc::ptr_eq(&snapshot_before, &state.snapshot()),
+            "a rejected reload must not publish a new snapshot"
+        );
 
         // Sanity: the old pool still answers.
         assert_eq!(
             state.lb("www").expect("www lb").select(None),
             Some(SocketAddr::from(([127, 0, 0, 1], 18081)))
         );
-        let _ = snapshot(&state);
     }
 
     #[test]
@@ -632,7 +668,7 @@ mod tests {
 
         let err = apply_new_config(&state, bad).expect_err("bad role must reject the reload");
         assert!(matches!(err, ReloadError::Build { component, .. } if component == "firewall"));
-        assert_eq!(state.config.load().openstack[0].firewall_dir, None);
+        assert_eq!(state.config().openstack[0].firewall_dir, None);
     }
 
     // ----- resolver cache retention -----
@@ -741,6 +777,71 @@ mod tests {
         );
     }
 
+    fn health_checked_site(name: &str, port: u16) -> ForwardSite {
+        let mut site = forward_site(name, &format!("{name}.example.com"), port);
+        site.health_check = Some(HealthCheck {
+            kind: HealthKind::Tcp,
+            http_path: None,
+            interval_secs: 5,
+            timeout_secs: 2,
+        });
+        site
+    }
+
+    #[test]
+    fn reload_adds_a_health_checked_site_to_the_shared_registry() {
+        let state = own_state(config_a());
+        assert_eq!(state.probes().slot_count(), 0, "no health checks configured yet");
+
+        let mut next = config_a();
+        next.forward.push(health_checked_site("api", 18083));
+        apply_new_config(&state, next).expect("apply");
+
+        // The new site's single backend is probed by the shared registry and
+        // its freshly built engine contributes to that same registry (FIX #2),
+        // so the already-running health-check service gates it with no
+        // re-attachment.
+        assert_eq!(state.probes().slot_count(), 1);
+        assert_eq!(
+            state.health_registry().target_count(),
+            2,
+            "the new engine must contribute to the shared registry"
+        );
+
+        // Removing the site stops probing it (FIX #8).
+        apply_new_config(&state, config_a()).expect("apply");
+        assert_eq!(state.probes().slot_count(), 0, "a removed site stops being probed");
+        assert!(state.lb("api").is_none());
+    }
+
+    #[test]
+    fn reload_changing_a_health_interval_keeps_gating_the_site() {
+        let mut initial = config_a();
+        initial.forward[0].health_check = Some(HealthCheck {
+            kind: HealthKind::Tcp,
+            http_path: None,
+            interval_secs: 5,
+            timeout_secs: 2,
+        });
+        let state = own_state(initial);
+        assert_eq!(state.probes().slot_count(), 1);
+
+        let mut changed = config_a();
+        changed.forward[0].health_check = Some(HealthCheck {
+            kind: HealthKind::Tcp,
+            http_path: None,
+            interval_secs: 1,
+            timeout_secs: 2,
+        });
+        apply_new_config(&state, changed).expect("apply");
+
+        assert_eq!(
+            state.probes().slot_count(),
+            1,
+            "the site stays probed after an interval change"
+        );
+    }
+
     // ----- ReloadService.load_config / reload_once -----
 
     fn write_forward_site(dir: &Path, port: u16) {
@@ -765,11 +866,11 @@ mod tests {
         write_forward_site(&sites, 18081);
 
         let service = service_for(&sites);
-        let before = service.state.fingerprint.load_full();
+        let before = service.state.fingerprint();
 
         write_forward_site(&sites, 18082);
         assert!(service.reload_once(true), "a changed config reloads");
-        assert_ne!(service.state.fingerprint.load_full().as_str(), before.as_str());
+        assert_ne!(service.state.fingerprint().as_str(), before.as_str());
         assert_eq!(
             service.state.lb("www").expect("www lb").select(None),
             Some(SocketAddr::from(([127, 0, 0, 1], 18082)))
@@ -784,12 +885,12 @@ mod tests {
         write_forward_site(&sites, 18081);
 
         let service = service_for(&sites);
-        let before = service.state.fingerprint.load_full();
+        let before = service.state.fingerprint();
 
         std::fs::write(sites.join("002-bad.yaml"), ": : not yaml\n").expect("write bad");
         assert!(!service.reload_once(true), "an invalid config must not reload");
         assert_eq!(
-            service.state.fingerprint.load_full().as_str(),
+            service.state.fingerprint().as_str(),
             before.as_str(),
             "the fingerprint must be unchanged after a rejected reload"
         );

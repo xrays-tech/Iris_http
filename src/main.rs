@@ -140,18 +140,18 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let config = load_config(&sites_dir, &env)
         .map_err(|err| anyhow::anyhow!("failed to load configuration: {err}"))?;
 
-    // Build the per-SNI certificate source before `config` is moved into the
-    // shared state. A missing/unparseable certificate is a startup failure.
-    let cert_source = SniCertSource::from_sites(&config)
-        .map_err(|err| anyhow::anyhow!("failed to build TLS certificate map: {err:#}"))?;
-
-    // Compile the routing table, per-site load balancers, firewall tables and
-    // instance resolvers into the shared snapshots read on the request path.
-    // A bad `.role` file fails startup here with context (`firewall.md` §2).
+    // Compile the routing table, per-site load balancers, firewall tables,
+    // certificate table and instance resolvers into the single shared snapshot
+    // read on the request path. A bad `.role` file or a missing/unparseable
+    // certificate fails startup here with context (`firewall.md` §2, FIX #1).
     let shared = Arc::new(
         SharedState::try_new(config)
             .map_err(|err| anyhow::anyhow!("failed to build shared state: {err}"))?,
     );
+
+    // The TLS certificate source reads the SAME snapshot the proxy reads, so a
+    // reloaded/added certificate takes effect on the next handshake (FIX #1).
+    let cert_source = SniCertSource::new(shared.handle());
 
     if let Some(pidfile) = &args.pidfile {
         write_pidfile(pidfile)?;
@@ -160,14 +160,15 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     let listen_addr = http_listen_addr();
     let tls_addr = tls_listen_addr();
     let metrics_addr = metrics_listen_addr(args.metrics_listen.as_deref());
-    let openstack_sites = shared.config.load().openstack.len();
-    let resolvers = shared.resolvers.load().len();
-    let firewalled_sites = shared.firewall.load().len();
-    let fingerprint = shared.fingerprint.load_full();
+    let snapshot = shared.snapshot();
+    let openstack_sites = snapshot.config.openstack.len();
+    let resolvers = snapshot.resolvers.len();
+    let firewalled_sites = snapshot.firewall.len();
+    let fingerprint = Arc::clone(&snapshot.fingerprint);
     tracing::info!(
         config_dir = %args.config_dir.display(),
         sites_dir = %sites_dir.display(),
-        forward_sites = shared.config.load().forward.len(),
+        forward_sites = snapshot.config.forward.len(),
         openstack_sites,
         resolvers,
         firewalled_sites,
@@ -271,7 +272,7 @@ impl ProxyHttp for VersionMetricsProxy {
                 let body = format!(
                     "binary={} config_hash={}\n",
                     env!("CARGO_PKG_VERSION"),
-                    self.shared.fingerprint.load_full().as_str()
+                    self.shared.fingerprint().as_str()
                 );
                 respond_text(session, 200, "text/plain; charset=utf-8", body).await?;
             }
@@ -309,24 +310,16 @@ impl ProxyHttp for VersionMetricsProxy {
     }
 }
 
-/// Register one background health-check service per forward site that
-/// configures `health_check` (`design.md` §4.5).
+/// Register the single shared forward health-check service (`design.md` §4.5).
+///
+/// One background service covers every forward site through the shared
+/// [`HealthRegistry`](pingora_load_balancing::HealthRegistry), so sites added or
+/// changed by a reload are gated without a per-site service (FIX #2).
 fn register_health_checks(server: &mut Server, shared: &Arc<SharedState>) {
-    let config = shared.config.load();
-    for site in &config.forward {
-        let Some(hc) = site.health_check.as_ref() else {
-            continue;
-        };
-        let Some(lb) = shared.lb(&site.name) else {
-            tracing::warn!(site = %site.name, "health_check configured but no load balancer found");
-            continue;
-        };
-        let name = format!("health check {}", site.name);
-        server.add_service(background_service(
-            &name,
-            health_check_service(lb, hc),
-        ));
-    }
+    server.add_service(background_service(
+        "health check",
+        health_check_service(shared.health_registry()),
+    ));
 }
 
 /// Build the [`Server`] with the [`ServerConf`] required by design.md §4.1
@@ -398,25 +391,23 @@ mod probe_tests {
         assert!(metrics.app_logic().is_some());
     }
 
-    /// P4 TLS assembly probe: `SniCertSource::from_sites` -> `TlsSettings::with_callbacks`
-    /// -> `enable_h2()` -> `svc.add_tls_with_settings(addr, None, settings)` on the
-    /// same proxy service as `add_tcp`. Compile-checks the real wiring without
-    /// binding a socket (binding happens at `run_forever`).
+    /// P4 TLS assembly probe: `SniCertSource::new` over the shared snapshot ->
+    /// `TlsSettings::with_callbacks` -> `enable_h2()` ->
+    /// `svc.add_tls_with_settings(addr, None, settings)` on the same proxy
+    /// service as `add_tcp`. Compile-checks the real wiring without binding a
+    /// socket (binding happens at `run_forever`).
     #[test]
     fn tls_service_assembly_compiles() {
         let conf = Arc::new(ServerConf::new().expect("default ServerConf"));
 
+        let shared = test_shared();
         let app = IrisProxy {
-            shared: test_shared(),
+            shared: Arc::clone(&shared),
         };
         let mut proxy = http_proxy_service(&conf, app);
         proxy.add_tcp("127.0.0.1:0");
 
-        let source = SniCertSource::from_sites(&Config {
-            forward: Vec::new(),
-            openstack: Vec::new(),
-        })
-        .expect("empty certificate map builds");
+        let source = SniCertSource::new(shared.handle());
         let mut tls_settings = TlsSettings::with_callbacks(Box::new(source))
             .expect("TLS settings with callbacks build");
         tls_settings.enable_h2();

@@ -31,6 +31,7 @@ use pingora::tls::ext;
 use pingora::tls::ssl::{NameType, SslRef};
 
 use crate::config::Config;
+use crate::state::Snapshot;
 
 /// Normalise a TLS SNI value into a certificate-map key.
 ///
@@ -225,30 +226,24 @@ impl TlsSni {
 
 /// The Pingora [`TlsAccept`] callback that selects a certificate per SNI.
 ///
-/// The certificate table is an [`ArcSwap`] snapshot so lookups on the handshake
-/// path are lock-free and a reload swaps the table atomically.
+/// It reads the certificate table from the **shared** [`Snapshot`] the proxy and
+/// reload also use (FIX #1): a reload that adds or rotates a certificate is
+/// visible on the very next handshake, because there is no separate certificate
+/// store that the TLS callback could lag behind.
 pub struct SniCertSource {
-    certs: ArcSwap<SniCertMap>,
+    snapshot: Arc<ArcSwap<Snapshot>>,
 }
 
 impl SniCertSource {
-    /// Build the source from a validated [`Config`].
-    pub fn from_sites(config: &Config) -> Result<Self> {
-        Ok(Self {
-            certs: ArcSwap::from_pointee(SniCertMap::from_sites(config)?),
-        })
-    }
-
-    /// Build the source from an existing map (used by tests / reload wiring).
-    pub fn new(map: SniCertMap) -> Self {
-        Self {
-            certs: ArcSwap::from_pointee(map),
-        }
+    /// Build the source over the shared configuration snapshot (constructed once
+    /// in `main` and also handed to the proxy / reload path).
+    pub fn new(snapshot: Arc<ArcSwap<Snapshot>>) -> Self {
+        Self { snapshot }
     }
 
     /// Look up the certificate currently mapped to `sni`.
     pub fn lookup(&self, sni: &str) -> Option<Arc<CertKey>> {
-        self.certs.load().lookup(sni)
+        self.snapshot.load().certs.lookup(sni)
     }
 }
 
@@ -259,8 +254,8 @@ impl TlsAccept for SniCertSource {
             .servername(NameType::HOST_NAME)
             .unwrap_or_default()
             .to_owned();
-        let map = self.certs.load();
-        let Some(cert) = map.lookup(&sni) else {
+        let snapshot = self.snapshot.load();
+        let Some(cert) = snapshot.certs.lookup(&sni) else {
             // No certificate for this SNI: install nothing so the handshake
             // aborts (there is no HTTP status to return at the TLS layer).
             tracing::debug!(sni = %sni, "no certificate configured for SNI; aborting handshake");

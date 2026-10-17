@@ -1,74 +1,125 @@
-//! P3 — shared state snapshots (`plan/02-contracts.md` §`src/state.rs`).
+//! P3 — shared state snapshot (`plan/02-contracts.md` §`src/state.rs`).
 //!
-//! [`SharedState`] owns the lock-free configuration snapshots the request path
-//! reads: the loaded [`Config`], the compiled [`RoutingTable`], the per-SNI
-//! certificate table, the per-site forward [`LbEngine`] pool, the per-openstack-
-//! site [`FirewallTable`] map and the per-openstack-site [`Resolver`] map. Every
-//! field is a full-snapshot [`ArcSwap`], so a reader takes an atomic snapshot
-//! and never blocks a writer.
+//! [`SharedState`] owns **one** [`arc_swap::ArcSwap`] of [`Snapshot`]: the whole
+//! request-path configuration — the loaded [`Config`], the compiled
+//! [`RoutingTable`], the per-SNI certificate table, the per-site forward
+//! [`LbEngine`] pool, the per-openstack-site [`FirewallTable`] map, the
+//! per-openstack-site [`Resolver`] map and the shared forward
+//! [`HealthRegistry`] — is published and replaced as a single value.
 //!
-//! P3 created the `config` / `routing` / `lbs` fields fixed by the contract; P4
-//! added `certs`; P7 adds `firewall` / `resolvers`; P8 adds the additive
-//! `fingerprint` field (the config content hash served by `/version`).
+//! A reader takes one atomic [`SharedState::snapshot`] and every filter of a
+//! request reads that same snapshot, so a reload can never be observed
+//! half-applied: the request sees either all of the old configuration or all of
+//! the new one (FIX #3). Because the certificate table lives inside the same
+//! snapshot, the TLS listener's [`crate::tls::SniCertSource`] reads the *same*
+//! store the proxy reads, so a reloaded certificate takes effect immediately
+//! (FIX #1).
 //!
-//! [`SharedState::try_new`] replaces P3's infallible `new`: building the
-//! per-site firewall tables can fail (a bad `.role` file must fail startup with
-//! context, `firewall.md` §2), so the constructor is fallible. The `lbs` /
-//! `certs` / `routing` construction semantics are unchanged.
+//! The forward [`HealthRegistry`] is shared across every engine and therefore
+//! does **not** change when the snapshot does; it is carried inside the snapshot
+//! so the request path (and reload) can reach it, but it is the same object
+//! across reloads (FIX #2). See [`crate::lb`].
+//!
+//! [`SharedState::try_new`] is fallible: a bad `.role` file (`firewall.md` §2)
+//! and a missing/unparseable certificate both fail startup with context.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use pingora_load_balancing::HealthRegistry;
 
 use crate::config::{Config, ConfigError};
 use crate::firewall::{build_firewall, FirewallTable};
-use crate::lb::{build_lb, LbEngine};
+use crate::lb::{build_lb, LbEngine, ProbeRegistry};
 use crate::openstack::{build_resolvers, Resolver};
 use crate::routing::RoutingTable;
 use crate::tls::SniCertMap;
 
-/// The process-wide shared state read on the request path.
-pub struct SharedState {
+/// One indivisible generation of the request-path configuration.
+///
+/// Everything a request needs is reachable from here, and every field is an
+/// `Arc` so cloning a snapshot (or a [`shallow`](Self::shallow) copy) is cheap
+/// and never deep-copies the pools.
+pub struct Snapshot {
     /// The loaded and validated site configuration.
-    pub config: ArcSwap<Config>,
+    pub config: Arc<Config>,
     /// The compiled host-routing table.
-    pub routing: ArcSwap<RoutingTable>,
-    /// The per-SNI certificate table served by the TLS listener (P4).
-    pub certs: ArcSwap<SniCertMap>,
+    pub routing: Arc<RoutingTable>,
     /// Forward-site load balancers, keyed by [`crate::config::ForwardSite::name`].
-    pub lbs: ArcSwap<HashMap<String, Arc<LbEngine>>>,
+    pub lbs: Arc<HashMap<String, Arc<LbEngine>>>,
+    /// The per-SNI certificate table served by the TLS listener (P4).
+    pub certs: Arc<SniCertMap>,
     /// Per-openstack-site firewall tables, keyed by
     /// [`crate::config::OpenStackSite::name`] (P7).
     ///
     /// A site **without** `firewall_dir` has no entry here, which means "no ACL
-    /// checks" for that site (`firewall.md` §4). The per-site map (rather than a
-    /// single merged table) is required so one site can enforce rules while
-    /// another skips them.
-    pub firewall: ArcSwap<HashMap<String, Arc<FirewallTable>>>,
+    /// checks" for that site (`firewall.md` §4).
+    pub firewall: Arc<HashMap<String, Arc<FirewallTable>>>,
     /// Per-openstack-site instance resolvers, keyed by
     /// [`crate::config::OpenStackSite::name`] (P7).
-    pub resolvers: ArcSwap<HashMap<String, Arc<dyn Resolver>>>,
+    pub resolvers: Arc<HashMap<String, Arc<dyn Resolver>>>,
+    /// The process-wide forward health registry, shared by every
+    /// [`LbEngine`] (FIX #2). The same object across reloads.
+    pub registry: Arc<HealthRegistry>,
     /// Stable content fingerprint of the loaded configuration (P8).
+    pub fingerprint: Arc<String>,
+}
+
+impl Snapshot {
+    /// A copy that shares every `Arc`; callers replace the field(s) they change.
     ///
-    /// Exposed by `/version` (and used to short-circuit `--watch-config`
-    /// re-scans); replaced atomically by [`crate::reload::apply_new_config`].
-    pub fingerprint: ArcSwap<String>,
+    /// Used to derive a locally-modified snapshot (the registry/health handle is
+    /// never rebuilt this way in production; tests use it to inject a resolver).
+    pub fn shallow(&self) -> Snapshot {
+        Snapshot {
+            config: Arc::clone(&self.config),
+            routing: Arc::clone(&self.routing),
+            lbs: Arc::clone(&self.lbs),
+            certs: Arc::clone(&self.certs),
+            firewall: Arc::clone(&self.firewall),
+            resolvers: Arc::clone(&self.resolvers),
+            registry: Arc::clone(&self.registry),
+            fingerprint: Arc::clone(&self.fingerprint),
+        }
+    }
+}
+
+impl fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never render resolver internals or certificate material; counts and
+        // the fingerprint are enough for logs.
+        f.debug_struct("Snapshot")
+            .field("forward_sites", &self.config.forward.len())
+            .field("openstack_sites", &self.config.openstack.len())
+            .field("resolvers", &self.resolvers.len())
+            .field("firewall_tables", &self.firewall.len())
+            .field("fingerprint", &self.fingerprint)
+            .finish()
+    }
+}
+
+/// The process-wide shared state read on the request path.
+pub struct SharedState {
+    /// The single atomic configuration snapshot (FIX #3).
+    snapshot: Arc<ArcSwap<Snapshot>>,
+    /// The shared active-probe registry backing every engine's health gating
+    /// (FIX #2). Lives outside the snapshot because it is mutable and shared
+    /// across generations.
+    probes: Arc<ProbeRegistry>,
 }
 
 impl SharedState {
     /// Build the shared state from a loaded [`Config`].
     ///
-    /// Constructs the routing table, one load balancer per forward site, the
-    /// per-SNI certificate table (best-effort — see below) and, per openstack
-    /// site, either a firewall table (fail-fast: a bad `.role` file fails the
-    /// whole build) or a `WARN` log when the site has no `firewall_dir`
-    /// (`firewall.md` §4), plus one instance resolver.
+    /// Constructs the routing table, one load balancer per forward site (all
+    /// sharing one [`HealthRegistry`]), the per-SNI certificate table and, per
+    /// openstack site, either a firewall table or a `WARN` log when the site has
+    /// no `firewall_dir` (`firewall.md` §4), plus one instance resolver.
     ///
-    /// Certificate parsing failures are logged and yield an empty table here:
-    /// startup (`main.rs`) builds the real [`crate::tls::SniCertSource`]
-    /// separately and fails fast on a bad certificate, so this best-effort path
-    /// only matters for reload.
+    /// A bad `.role` file (`firewall.md` §2) or a missing/unparseable
+    /// certificate fails the whole build with context (startup is fail-fast).
     pub fn try_new(config: Config) -> Result<Self, ConfigError> {
         let routing = RoutingTable::try_from(&config)
             .map_err(|err| ConfigError::Validate(err.to_string()))?;
@@ -77,22 +128,26 @@ impl SharedState {
         // is moved into the snapshot (P8, reload.rs).
         let fingerprint = crate::reload::config_fingerprint(&config);
 
+        let certs = SniCertMap::from_sites(&config)
+            .map_err(|err| ConfigError::Validate(format!("{err:#}")))?;
+
+        // One health registry for every forward engine, with one dispatching
+        // probe covering all of them (FIX #2).
+        let registry = Arc::new(HealthRegistry::new());
+        let probes = Arc::new(ProbeRegistry::new());
+        registry.set_health_check(Box::new(crate::lb::SharedProbe(Arc::clone(&probes))));
+        probes.sync(&config);
+
         let lbs: HashMap<String, Arc<LbEngine>> = config
             .forward
             .iter()
-            .map(|site| (site.name.clone(), build_lb(&site.backends, &site.lb_mode)))
+            .map(|site| {
+                (
+                    site.name.clone(),
+                    build_lb(&site.backends, &site.lb_mode, &registry),
+                )
+            })
             .collect();
-
-        let certs = match SniCertMap::from_sites(&config) {
-            Ok(map) => map,
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    "failed to build certificate map; TLS SNI lookup table left empty"
-                );
-                SniCertMap::empty()
-            }
-        };
 
         // Build one firewall table per openstack site that configures a
         // `firewall_dir`; a malformed `.role` file fails the whole build. A
@@ -116,30 +171,72 @@ impl SharedState {
 
         let resolvers = build_resolvers(&config);
 
+        let snapshot = Snapshot {
+            config: Arc::new(config),
+            routing: Arc::new(routing),
+            lbs: Arc::new(lbs),
+            certs: Arc::new(certs),
+            firewall: Arc::new(firewall),
+            resolvers: Arc::new(resolvers),
+            registry,
+            fingerprint: Arc::new(fingerprint),
+        };
+
         Ok(Self {
-            config: ArcSwap::from_pointee(config),
-            routing: ArcSwap::from_pointee(routing),
-            certs: ArcSwap::from_pointee(certs),
-            lbs: ArcSwap::from_pointee(lbs),
-            firewall: ArcSwap::from_pointee(firewall),
-            resolvers: ArcSwap::from_pointee(resolvers),
-            fingerprint: ArcSwap::from_pointee(fingerprint),
+            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            probes,
         })
+    }
+
+    /// The shared [`ArcSwap`] handle (handed to the TLS certificate source so
+    /// it reads the same snapshot the proxy reads — FIX #1).
+    pub fn handle(&self) -> Arc<ArcSwap<Snapshot>> {
+        Arc::clone(&self.snapshot)
+    }
+
+    /// Take the current configuration snapshot atomically.
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.snapshot.load_full()
+    }
+
+    /// Publish a new configuration snapshot atomically (reload commit).
+    pub fn store(&self, snapshot: Snapshot) {
+        self.snapshot.store(Arc::new(snapshot));
+    }
+
+    /// The shared forward health-probe registry (FIX #2).
+    pub fn probes(&self) -> Arc<ProbeRegistry> {
+        Arc::clone(&self.probes)
+    }
+
+    /// The shared forward [`HealthRegistry`].
+    pub fn health_registry(&self) -> Arc<HealthRegistry> {
+        Arc::clone(&self.snapshot.load().registry)
+    }
+
+    /// The current loaded configuration.
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.snapshot.load().config)
+    }
+
+    /// The current configuration fingerprint.
+    pub fn fingerprint(&self) -> Arc<String> {
+        Arc::clone(&self.snapshot.load().fingerprint)
     }
 
     /// Load the load balancer for forward site `name`, if any.
     pub fn lb(&self, name: &str) -> Option<Arc<LbEngine>> {
-        self.lbs.load().get(name).cloned()
+        self.snapshot.load().lbs.get(name).cloned()
     }
 
     /// Load the firewall table for openstack site `name`, if any.
     pub fn firewall_for(&self, name: &str) -> Option<Arc<FirewallTable>> {
-        self.firewall.load().get(name).cloned()
+        self.snapshot.load().firewall.get(name).cloned()
     }
 
     /// Load the resolver for openstack site `name`, if any.
     pub fn resolver_for(&self, name: &str) -> Option<Arc<dyn Resolver>> {
-        self.resolvers.load().get(name).cloned()
+        self.snapshot.load().resolvers.get(name).cloned()
     }
 }
 
@@ -218,11 +315,12 @@ mod tests {
     }
 
     #[test]
-    fn builds_one_lb_per_forward_site() {        let state = state_with(vec![
+    fn builds_one_lb_per_forward_site() {
+        let state = state_with(vec![
             forward_site("a", "a.example.com", LbMode::RoundRobin),
             forward_site("b", "b.example.com", LbMode::Ketama),
         ]);
-        assert_eq!(state.lbs.load().len(), 2);
+        assert_eq!(state.snapshot().lbs.len(), 2);
         assert!(state.lb("a").is_some());
         assert!(state.lb("b").is_some());
         assert!(state.lb("missing").is_none());
@@ -231,9 +329,9 @@ mod tests {
     #[test]
     fn config_and_routing_snapshots_are_accessible() {
         let state = state_with(vec![forward_site("www", "www.example.com", LbMode::Random)]);
-        assert_eq!(state.config.load().forward.len(), 1);
+        assert_eq!(state.config().forward.len(), 1);
         assert_eq!(
-            state.routing.load().lookup("www.example.com"),
+            state.snapshot().routing.lookup("www.example.com"),
             Some(crate::routing::RouteTarget::Forward(0))
         );
     }
@@ -241,24 +339,42 @@ mod tests {
     #[test]
     fn no_forward_sites_yields_empty_lb_map() {
         let state = state_with(Vec::new());
-        assert!(state.lbs.load().is_empty());
+        assert!(state.snapshot().lbs.is_empty());
     }
 
     #[test]
     fn http_only_sites_yield_empty_cert_map() {
         let state = state_with(vec![forward_site("www", "www.example.com", LbMode::RoundRobin)]);
-        assert!(state.certs.load().lookup("www.example.com").is_none());
+        assert!(state.snapshot().certs.lookup("www.example.com").is_none());
     }
 
     #[test]
     fn https_site_populates_cert_map() {
         let state = state_with(vec![https_site("www", "www.example.com")]);
         let cert = state
+            .snapshot()
             .certs
-            .load()
             .lookup("www.example.com")
             .expect("https site certificate is registered");
         assert_eq!(cert.site(), "www");
+    }
+
+    #[test]
+    fn missing_certificate_fails_the_build() {
+        // Startup is fail-fast on a bad certificate (FIX #1: the snapshot is the
+        // single certificate store, so it must be built correctly).
+        let mut site = https_site("www", "www.example.com");
+        site.cert_file = Some("/no/such/cert.pem".into());
+        site.key_file = Some("/no/such/key.pem".into());
+        let config = Config {
+            forward: vec![site],
+            openstack: Vec::new(),
+        };
+        let err = match SharedState::try_new(config) {
+            Ok(_) => panic!("a missing certificate must fail the build"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
     }
 
     // ----- P7: firewall / resolvers wiring -----
@@ -271,12 +387,12 @@ mod tests {
         };
         let state = SharedState::try_new(config).expect("state builds");
         assert!(
-            state.firewall.load().is_empty(),
+            state.snapshot().firewall.is_empty(),
             "a site without firewall_dir must not appear in the firewall map"
         );
         assert!(state.firewall_for("rent").is_none());
         assert!(state.resolver_for("rent").is_some());
-        assert_eq!(state.resolvers.load().len(), 1);
+        assert_eq!(state.snapshot().resolvers.len(), 1);
     }
 
     #[test]
@@ -322,8 +438,8 @@ mod tests {
         };
         let a = SharedState::try_new(config()).expect("state builds");
         let b = SharedState::try_new(config()).expect("state builds");
-        assert!(!a.fingerprint.load_full().is_empty());
-        assert_eq!(a.fingerprint.load_full().as_str(), b.fingerprint.load_full().as_str());
+        assert!(!a.fingerprint().is_empty());
+        assert_eq!(a.fingerprint().as_str(), b.fingerprint().as_str());
     }
 
     #[test]
@@ -338,6 +454,24 @@ mod tests {
             openstack: Vec::new(),
         })
         .expect("state builds");
-        assert_ne!(a.fingerprint.load_full().as_str(), b.fingerprint.load_full().as_str());
+        assert_ne!(a.fingerprint().as_str(), b.fingerprint().as_str());
+    }
+
+    // ----- FIX #2: the shared registry is reachable and shared -----
+
+    #[test]
+    fn forward_engines_share_the_snapshot_registry() {
+        let mut a = forward_site("a", "a.example.com", LbMode::RoundRobin);
+        a.backends[0].addr = SocketAddr::from(([127, 0, 0, 1], 18091));
+        let mut b = forward_site("b", "b.example.com", LbMode::Random);
+        b.backends[0].addr = SocketAddr::from(([127, 0, 0, 1], 18092));
+        let state = state_with(vec![a, b]);
+
+        // Both engines' views contribute to the one snapshot registry.
+        assert_eq!(
+            state.health_registry().target_count(),
+            2,
+            "every forward engine must contribute to the shared registry"
+        );
     }
 }

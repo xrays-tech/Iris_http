@@ -26,7 +26,7 @@ use pingora::{Error, ErrorType, Result};
 use crate::firewall::{AclReason, AclVerdict, FirewallTable};
 use crate::openstack::{ResolveError, ResolvedInstance};
 use crate::routing::{normalize_host, RouteTarget};
-use crate::state::SharedState;
+use crate::state::{SharedState, Snapshot};
 use crate::tls::TlsSni;
 
 /// Value advertised in the `Server` response header.
@@ -49,6 +49,10 @@ pub const MAX_CONNECT_RETRIES: u32 = 1;
 /// P7 adds three additive fields for the OpenStack lane: the resolved
 /// floating/fixed addresses, the target port and the fixed-fallback flag so
 /// `upstream_peer` can recompute the upstream per attempt.
+///
+/// FIX #3 adds `snapshot`: the single configuration snapshot taken once in
+/// `request_filter` and reused by every later filter, so one request never sees
+/// a mixture of old and new configuration.
 #[derive(Debug, Default)]
 pub struct Ctx {
     /// The resolved route target, if any.
@@ -67,6 +71,8 @@ pub struct Ctx {
     pub openstack_port: Option<u16>,
     /// Whether the next upstream attempt must use the fixed address (P7).
     pub use_fixed: bool,
+    /// The configuration snapshot this request is served from (FIX #3).
+    pub snapshot: Option<Arc<Snapshot>>,
 }
 
 /// The forward-lane proxy application.
@@ -75,22 +81,21 @@ pub struct IrisProxy {
     pub shared: Arc<SharedState>,
 }
 
-impl IrisProxy {
-    /// The `(https, site_name)` pair for a matched route, or `None` when the
-    /// host matched no site.
-    fn site_facts(&self, decision: &RouteDecision) -> Option<(bool, String)> {
-        let config = self.shared.config.load();
-        match decision {
-            RouteDecision::Forward { site_idx, .. } => config
-                .forward
-                .get(*site_idx)
-                .map(|site| (site.https, site.name.clone())),
-            RouteDecision::OpenStack { site_idx, .. } => config
-                .openstack
-                .get(*site_idx)
-                .map(|site| (site.https, site.name.clone())),
-            RouteDecision::NotFound => None,
-        }
+/// The `(https, site_name)` pair for a matched route, or `None` when the host
+/// matched no site. Reads the request's snapshot (FIX #3).
+pub fn site_facts(snapshot: &Snapshot, decision: &RouteDecision) -> Option<(bool, String)> {
+    match decision {
+        RouteDecision::Forward { site_idx, .. } => snapshot
+            .config
+            .forward
+            .get(*site_idx)
+            .map(|site| (site.https, site.name.clone())),
+        RouteDecision::OpenStack { site_idx, .. } => snapshot
+            .config
+            .openstack
+            .get(*site_idx)
+            .map(|site| (site.https, site.name.clone())),
+        RouteDecision::NotFound => None,
     }
 }
 
@@ -117,19 +122,18 @@ pub enum RouteDecision {
     NotFound,
 }
 
-/// Resolve a raw request host to a [`RouteDecision`].
+/// Resolve a raw request host to a [`RouteDecision`] against `snapshot`.
 ///
 /// Host normalisation follows `config.md` §8; matching order (exact then
 /// wildcard) is owned by [`crate::routing::RoutingTable::lookup`].
-pub fn decide_route(shared: &SharedState, raw_host: &str) -> RouteDecision {
+pub fn decide_route(snapshot: &Snapshot, raw_host: &str) -> RouteDecision {
     let host = normalize_host(raw_host);
-    let target = shared.routing.load().lookup(&host);
+    let target = snapshot.routing.lookup(&host);
     match target {
         None => RouteDecision::NotFound,
         Some(RouteTarget::Forward(idx)) => {
-            let site = shared
+            let site = snapshot
                 .config
-                .load()
                 .forward
                 .get(idx)
                 .map(|site| site.name.clone());
@@ -150,14 +154,14 @@ pub fn decide_route(shared: &SharedState, raw_host: &str) -> RouteDecision {
     }
 }
 
-/// Select an upstream backend for `site` using `client` as the hash key.
+/// Select an upstream backend for `site` using `client` as the hash key, from
+/// the request's snapshot (FIX #3).
 pub fn select_backend(
-    shared: &SharedState,
+    snapshot: &Snapshot,
     site: &str,
     client: Option<IpAddr>,
 ) -> Option<SocketAddr> {
-    let lbs = shared.lbs.load();
-    lbs.get(site).and_then(|lb| lb.select(client))
+    snapshot.lbs.get(site).and_then(|lb| lb.select(client))
 }
 
 /// Whether another upstream attempt is allowed after `failures` connect
@@ -301,29 +305,26 @@ pub enum OpenStackOutcome {
 /// discovery (`plan/10` §目标).
 ///
 /// This is the injectable seam used by `request_filter`: it reads the firewall
-/// table and [`Resolver`](crate::openstack::Resolver) from `shared`, so unit
-/// tests exercise the real mapping with a fake resolver and a real firewall
-/// table.
+/// table and [`Resolver`](crate::openstack::Resolver) from `snapshot` (FIX #3),
+/// so unit tests exercise the real mapping with a fake resolver and a real
+/// firewall table.
 pub async fn openstack_gate(
-    shared: &SharedState,
+    snapshot: &Snapshot,
     site_idx: usize,
     instance: &str,
     port: u16,
     client: Option<IpAddr>,
 ) -> OpenStackOutcome {
-    let config = shared.config.load();
-    let Some(site) = config.openstack.get(site_idx) else {
+    let Some(site) = snapshot.config.openstack.get(site_idx) else {
         // A routing table entry that no longer maps to a site: treat as no
         // such route target.
         return OpenStackOutcome::Deny(404);
     };
     let site_name = site.name.clone();
     let has_firewall = site.firewall_dir.is_some();
-    drop(config);
 
     // Firewall ACL first: a denial must not reach discovery (`firewall.md` §1).
-    let firewall = shared.firewall.load();
-    let table = firewall.get(&site_name).map(|table| table.as_ref());
+    let table = snapshot.firewall.get(&site_name).map(|table| table.as_ref());
     let status = match client {
         Some(ip) => {
             let verdict = firewall_verdict_to_http(table, instance, port, ip, has_firewall);
@@ -354,9 +355,8 @@ pub async fn openstack_gate(
         );
         return OpenStackOutcome::Deny(code);
     }
-    drop(firewall);
 
-    let Some(resolver) = shared.resolvers.load().get(&site_name).cloned() else {
+    let Some(resolver) = snapshot.resolvers.get(&site_name).cloned() else {
         tracing::error!(site = %site_name, "no resolver configured for openstack site");
         return OpenStackOutcome::Deny(502);
     };
@@ -432,18 +432,20 @@ impl ProxyHttp for IrisProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
+        // One snapshot for the whole request (FIX #3): routing, the 421 cert
+        // check, the firewall table, the resolver and upstream selection all
+        // read this same value, so a reload can never be observed half-applied.
+        let snapshot = self.shared.snapshot();
         let host = request_host(session);
-        let decision = decide_route(&self.shared, &host);
+        let decision = decide_route(&snapshot, &host);
 
         // Misdirected-request guard (P4): only a TLS connection can be
         // misdirected. A site that does not serve HTTPS, or one whose
         // certificate the SNI did not select, must be answered with 421.
         if let Some(sni) = tls_sni(session) {
-            if let Some((site_https, site_name)) = self.site_facts(&decision) {
-                let same_site_as_sni = self
-                    .shared
+            if let Some((site_https, site_name)) = site_facts(&snapshot, &decision) {
+                let same_site_as_sni = snapshot
                     .certs
-                    .load()
                     .lookup(&sni)
                     .map(|cert| cert.site() == site_name.as_str())
                     .unwrap_or(false);
@@ -464,6 +466,7 @@ impl ProxyHttp for IrisProxy {
             RouteDecision::Forward { site, site_idx } => {
                 ctx.route = Some(RouteTarget::Forward(site_idx));
                 ctx.site = Some(site);
+                ctx.snapshot = Some(snapshot);
                 Ok(false)
             }
             RouteDecision::NotFound => {
@@ -476,7 +479,7 @@ impl ProxyHttp for IrisProxy {
                 instance,
                 port,
             } => {
-                match openstack_gate(&self.shared, site_idx, &instance, port, client_ip(session))
+                match openstack_gate(&snapshot, site_idx, &instance, port, client_ip(session))
                     .await
                 {
                     OpenStackOutcome::Deny(code) => {
@@ -497,6 +500,7 @@ impl ProxyHttp for IrisProxy {
                         ctx.instance = Some(instance);
                         ctx.openstack_port = Some(port);
                         ctx.resolved = Some(resolved);
+                        ctx.snapshot = Some(snapshot);
                         Ok(false)
                     }
                 }
@@ -505,6 +509,15 @@ impl ProxyHttp for IrisProxy {
     }
 
     async fn upstream_peer(&self, session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
+        // The snapshot taken in `request_filter` (FIX #3); every filter reads
+        // the same value.
+        let snapshot = ctx.snapshot.as_deref().ok_or_else(|| {
+            Error::explain(
+                ErrorType::HTTPStatus(502),
+                "request context has no configuration snapshot",
+            )
+        })?;
+
         // OpenStack peers recompute per attempt so the fixed-address fallback
         // (`ctx.use_fixed`, set by `fail_to_connect`) takes effect on retry.
         let addr = match ctx.route.clone() {
@@ -538,7 +551,7 @@ impl ProxyHttp for IrisProxy {
 
                 // Selection runs here (not in `request_filter`) so each retry
                 // re-runs load balancing and can land on a different backend.
-                select_backend(&self.shared, &site, client_ip(session)).ok_or_else(|| {
+                select_backend(snapshot, &site, client_ip(session)).ok_or_else(|| {
                     Error::explain(
                         ErrorType::HTTPStatus(502),
                         format!("no healthy upstream for forward site '{site}'"),
@@ -670,7 +683,7 @@ mod tests {
     fn decide_route_matches_forward_site_case_insensitively() {
         let state = state(vec![forward_site("www", "www.example.com", &[(18081, 1)])], vec![]);
         assert_eq!(
-            decide_route(&state, "WWW.Example.COM:80"),
+            decide_route(&state.snapshot(), "WWW.Example.COM:80"),
             RouteDecision::Forward {
                 site: "www".to_owned(),
                 site_idx: 0,
@@ -681,15 +694,15 @@ mod tests {
     #[test]
     fn decide_route_returns_not_found_for_unknown_host() {
         let state = state(vec![forward_site("www", "www.example.com", &[(18081, 1)])], vec![]);
-        assert_eq!(decide_route(&state, "unknown.test"), RouteDecision::NotFound);
-        assert_eq!(decide_route(&state, ""), RouteDecision::NotFound);
+        assert_eq!(decide_route(&state.snapshot(), "unknown.test"), RouteDecision::NotFound);
+        assert_eq!(decide_route(&state.snapshot(), ""), RouteDecision::NotFound);
     }
 
     #[test]
     fn decide_route_matches_openstack_wildcard() {
         let state = state(vec![], vec![openstack_site("rent", "rent.do.top")]);
         assert_eq!(
-            decide_route(&state, "my-app-8080.rent.do.top"),
+            decide_route(&state.snapshot(), "my-app-8080.rent.do.top"),
             RouteDecision::OpenStack {
                 site_idx: 0,
                 instance: "my-app".to_owned(),
@@ -697,7 +710,7 @@ mod tests {
             }
         );
         // Bare base domain is not routable.
-        assert_eq!(decide_route(&state, "rent.do.top"), RouteDecision::NotFound);
+        assert_eq!(decide_route(&state.snapshot(), "rent.do.top"), RouteDecision::NotFound);
     }
 
     // ----- select_backend -----
@@ -708,7 +721,7 @@ mod tests {
             vec![forward_site("www", "www.example.com", &[(18081, 1), (18082, 1)])],
             vec![],
         );
-        let selected = select_backend(&state, "www", Some(IpAddr::from([10, 0, 0, 1])));
+        let selected = select_backend(&state.snapshot(), "www", Some(IpAddr::from([10, 0, 0, 1])));
         assert!(
             selected == Some(SocketAddr::from(([127, 0, 0, 1], 18081)))
                 || selected == Some(SocketAddr::from(([127, 0, 0, 1], 18082)))
@@ -718,7 +731,7 @@ mod tests {
     #[test]
     fn select_backend_unknown_site_returns_none() {
         let state = state(vec![forward_site("www", "www.example.com", &[(18081, 1)])], vec![]);
-        assert_eq!(select_backend(&state, "missing", None), None);
+        assert_eq!(select_backend(&state.snapshot(), "missing", None), None);
     }
 
     // ----- retry policy -----
@@ -987,9 +1000,18 @@ mod tests {
     }
 
     fn inject_resolver(shared: &SharedState, site: &str, resolver: Arc<dyn crate::openstack::Resolver>) {
-        let mut map = (**shared.resolvers.load()).clone();
+        let mut snapshot = shared.snapshot().shallow();
+        let mut map = (*snapshot.resolvers).clone();
         map.insert(site.to_owned(), resolver);
-        shared.resolvers.store(Arc::new(map));
+        snapshot.resolvers = Arc::new(map);
+        shared.store(snapshot);
+    }
+
+    /// Replace the current snapshot's resolver map with an empty one (test seam).
+    fn clear_resolvers(shared: &SharedState) {
+        let mut snapshot = shared.snapshot().shallow();
+        snapshot.resolvers = Arc::new(std::collections::HashMap::new());
+        shared.store(snapshot);
     }
 
     #[tokio::test]
@@ -1001,7 +1023,7 @@ mod tests {
         )));
         inject_resolver(&shared, "rent", fake.clone());
 
-        let outcome = openstack_gate(&shared, 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
+        let outcome = openstack_gate(&shared.snapshot(), 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(
             outcome,
             OpenStackOutcome::Serve {
@@ -1029,7 +1051,7 @@ mod tests {
         inject_resolver(&shared, "rent", fake.clone());
 
         // Port 8080 is not open for `web`.
-        let outcome = openstack_gate(&shared, 0, "web", 8080, Some(ip([127, 0, 0, 1]))).await;
+        let outcome = openstack_gate(&shared.snapshot(), 0, "web", 8080, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(outcome, OpenStackOutcome::Deny(403));
         assert_eq!(fake.calls(), 0, "ACL denial must not reach discovery");
     }
@@ -1048,7 +1070,7 @@ mod tests {
         );
         inject_resolver(&shared, "rent", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
 
-        let outcome = openstack_gate(&shared, 0, "ghost", 80, Some(ip([127, 0, 0, 1]))).await;
+        let outcome = openstack_gate(&shared.snapshot(), 0, "ghost", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(outcome, OpenStackOutcome::Deny(403));
     }
 
@@ -1070,7 +1092,7 @@ mod tests {
         );
         inject_resolver(&shared, "rent", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
 
-        let outcome = openstack_gate(&shared, 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
+        let outcome = openstack_gate(&shared.snapshot(), 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(outcome, OpenStackOutcome::Deny(403));
     }
 
@@ -1087,7 +1109,7 @@ mod tests {
             (ResolveError::NoAddress, 502),
         ] {
             inject_resolver(&shared, "rent", Arc::new(FakeResolver::err(err)));
-            let outcome = openstack_gate(&shared, 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
+            let outcome = openstack_gate(&shared.snapshot(), 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
             assert_eq!(outcome, OpenStackOutcome::Deny(want));
         }
     }
@@ -1095,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn gate_denies_404_when_site_index_is_missing() {
         let shared = state(vec![], vec![]);
-        let outcome = openstack_gate(&shared, 3, "web", 80, Some(ip([127, 0, 0, 1]))).await;
+        let outcome = openstack_gate(&shared.snapshot(), 3, "web", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(outcome, OpenStackOutcome::Deny(404));
     }
 
@@ -1103,8 +1125,8 @@ mod tests {
     async fn gate_denies_502_when_no_resolver_configured() {
         let shared = state(vec![], vec![openstack_site("rent", "rent.do.top")]);
         // Drop the auto-built resolver for this site.
-        shared.resolvers.store(Arc::new(std::collections::HashMap::new()));
-        let outcome = openstack_gate(&shared, 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
+        clear_resolvers(&shared);
+        let outcome = openstack_gate(&shared.snapshot(), 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(outcome, OpenStackOutcome::Deny(502));
     }
 }
