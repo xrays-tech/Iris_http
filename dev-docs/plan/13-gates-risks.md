@@ -20,6 +20,10 @@
 | 重载语义破坏在途连接 | P8 端到端专门验证"慢请求/WebSocket 跨重载""坏配置保持旧态" | P8 |
 | 地址选择/ACL 判定边界漏测 | 表驱动单测覆盖浮动/固定/IPv6/多网卡/CIDR 边界 | P5/P6 |
 | secret 泄漏进日志 | P1 redacted Debug 单测 + 全局日志扫关键词 | P1 |
+| SIGHUP 是否被 Pingora 接管不明，缺省可能杀进程 | P0 API 探针验证归属；P8 若需则自建 tokio `SignalKind::hangup()` 重载任务 | P0/P8 |
+| LoadBalancer selection 泛型 / 权重字段形态不确定 | `LbEngine` 包装解耦契约；P0 探针实测后由 P3 落定内层映射 | P0/P3 |
+| 监听器装配归属不确定（向 Service 挂监听） | P0 探针；P4 照实装配（`add_tcp`/`add_tls_with_settings`） | P0/P4 |
+| openstack HTTPS 依赖通配证书 | 文档明示 operator 提供 `*.base_domain`；P4 端到端覆盖 SNI 通配 | P4 |
 
 ## 3. 依赖与版本（P0 落定 Cargo.toml）
 
@@ -43,6 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["json"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }   # OpenStack 客户端
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
+async-trait = "0.1"   # Resolver 注入缝（P7 测试用）
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

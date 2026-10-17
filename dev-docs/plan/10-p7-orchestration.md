@@ -1,17 +1,17 @@
 # P7 — openstack/firewall 编排集成
 
 - **依赖**：P3、P5、P6 全部完成。
-- **文件范围**：`src/proxy.rs`（追加 openstack 分支）、`src/main.rs`（装配 openstack 站点与 resolver/firewall 初始化）、`src/openstack/mod.rs`（暴露 resolver 构造，契约见 `02-contracts.md`）。
+- **文件范围**：`src/proxy.rs`（追加 openstack 分支）、`src/main.rs`（装配 openstack 站点与 resolver/firewall 初始化）、`src/openstack/mod.rs`（暴露 resolver 构造，契约见 `02-contracts.md`）、`src/state.rs`（追加 `firewall`/`resolvers` 字段，纯增量）。
 - **设计参考**：`design.md` §4.3/§4.6/§4.7、§5；`discovery.md` §7/§8；`firewall.md` §3。
 
 ## 目标
 - `request_filter` 补全 openstack 分支：
   1. `RouteTarget::OpenStack { site_idx, instance, port }`；
   2. `firewall.check(instance, port, client_ip)` → `Deny` → 403（按 `AclReason` 区分指标）；
-  3. `resolver.resolve(instance)`，错误映射：`NotFound` → 404、`AuthFailed`/`DiscoveryUnavailable`/`NoAddress` → 502；`allow` → 进入 upstream。
+  3. `resolver.resolve(instance)`（经 `SharedState.resolvers` 的 `Arc<dyn Resolver>` 注入缝——`02-contracts.md`；单测注入 fake，OpenStack 外部边界允许 mock 容器），错误映射：`NotFound` → 404、`AuthFailed`/`DiscoveryUnavailable`/`NoAddress` → 502；`allow` → 进入 upstream。
 - `fail_to_connect`：floating 失败回退 fixed 重试一次（`ResolvedInstance` 有两个地址时）。
 - `upstream_peer`：`HttpPeer::new(SocketAddr::new(ip, port), false, "")`。
-- `main.rs`：初始化 `SharedState` 雏形（config/routing/firewall/resolvers `ArcSwap`/`Arc`），openstack 站点可端到端跑通；`Ctx` 记录 `instance`。
+- `main.rs`：初始化 `SharedState`（config/routing/lbs/certs 已由前序阶段创建，本阶段追加 `firewall`/`resolvers` 字段，均为 `ArcSwap`），openstack 站点可端到端跑通；`Ctx` 记录 `instance`。
 - `FirewallTable` 空目录时按 `firewall.md` §4 语义（未配置 `firewall_dir` → 不校验；配置了但无 role → 403）。
 
 ## TDD 单测清单

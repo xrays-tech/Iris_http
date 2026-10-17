@@ -31,6 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["json"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }   # OpenStack 客户端
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
+async-trait = "0.1"                 # Resolver 注入缝（P7 测试用）
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -40,6 +41,13 @@ tokio = { version = "1", features = ["full", "test-util"] }
 - 若 `pingora = "0.9"` 解析不到，回退 `"0.9.*"` 并以实际版本核对 API
   （`TlsSettings::with_callbacks`、`HttpPeer::new(addr,tls,sni)`、`PeerOptions`、
   `pingora_core::services::background`）；**任何 API 差异在本阶段回报**，仅调整实现映射，不改接口契约。
+
+## API 探针冒烟（P0 门禁新增；结果回报以校正 `02-contracts.md` 与 P3 映射）
+
+1. **SIGHUP 归属**：确认 `run_forever` 是否安装/占用 SIGHUP 处理器；若默认行为会杀进程，则记录"P8 须自建 tokio `SignalKind::hangup()` 重载任务"。
+2. **监听器装配**：确认实际方式是向代理 Service 挂监听（`http_proxy_service(&conf, app)` 后 `svc.add_tcp(...)` / `svc.add_tls_with_settings(...)`，再 `server.add_service(svc)`），而非 `server.add_listener`。
+3. **LoadBalancer 形态**：selection 为泛型类型（`LoadBalancer<RoundRobin>`/`<Random>`/`<Consistent>`）；`Backend` 权重字段或变体；`select()`（ketama hash 参数）；`update()` 是否需要 `&mut self`——这决定 `LbEngine` 内部共享方式；`consistent-hashing` 特性是否需要开启。
+4. **后台服务/指标装配**：`background_service`/`BackgroundService`/`ShutdownWatch`、`prometheus_http_service()` 可编译装配冒烟。
 
 ## TDD 单测清单
 - `reload` 子命令：pidfile 缺失/损坏/路径非法 → 明确报错；临时有效 pidfile → 成功发出 `SIGHUP`（用测试仅验证信号发送路径，不真杀进程）。

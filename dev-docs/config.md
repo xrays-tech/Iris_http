@@ -61,7 +61,7 @@ health_check:
 字段规则：
 
 - `domain`：合法域名（允许 `*.` 开头的通配域名？**本版本不支持**——forward 为精确匹配；通配能力仅由 openstack 模式的 `base_domain` 提供，避免两类匹配语义混杂）。
-- `backends`：至少 1 项；`addr` 为 `IP:port`（不接受域名，避免启动期 DNS 依赖）；`weight` 为 `>= 0` 整数，默认 `1`。`weight` 仅对加权模式生效。
+- `backends`：至少 1 项；`addr` 为 `IP:port`（不接受域名，避免启动期 DNS 依赖）；`weight` 为 `0..=65535` 整数，默认 `1`；`0` 表示禁用该后端（不参与选择与健康检查）；越界拒绝。`weight` 仅对加权模式生效。
 - `load_balancer`：见 §5 映射表。
 - `health_check`：可选；缺省不做主动健康检查。`kind=http` 时额外发请求并由 2xx/3xx 判定健康。
 
@@ -109,7 +109,7 @@ openstack:
 | 配置值 | Pingora `Algorithm` | 语义 |
 |---|---|---|
 | `round_robin` | `RoundRobin` | 等权轮询 |
-| `weighted_round_robin` | `RoundRobin` + `Backend::Weighted` | 加权轮询（Pingora RoundRobin 对 Weighted 后端的原生行为） |
+| `weighted_round_robin` | `LbEngine::RR` + 权重（Pingora 加权轮询原生行为；内层泛型/权重形态以 P0 探针为准） | 加权轮询 |
 | `random` | `Random` | 随机选择 |
 | `ketama` | `Ketama` | 一致性哈希（键：客户端 IP），会话亲和 |
 
@@ -139,7 +139,7 @@ openstack:
 
 ## 8. 域名匹配规则
 
-输入：请求 `Host` 头或 TLS SNI（443）。归一化：**小写、去尾部点、去端口后再匹配**（80/443 缺省端口；非缺省端口单独处理——代理对外端口固定为 80/443，携带非缺省端口的 Host 不达路由）。
+输入：请求 `Host` 头或 TLS SNI（443）。归一化：**小写、去尾部点**；剥离 `:80`/`:443` 缺省端口；**非缺省端口保留**——代理仅对外监听 80/443，携带非缺省端口的 Host 无法命中任何站点（→ 404）。
 
 **匹配顺序（先精确、后通配）**：
 

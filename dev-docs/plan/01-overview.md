@@ -30,12 +30,14 @@ P0 → P1 → P2 → { P3 → P4 , P5 , P6 } → P7 → P8
 | P0 | `plan/03-p0-scaffold.md` | 脚手架与 CLI | `Cargo.toml`、`src/main.rs`、`src/lib.rs`、`src/errors.rs`、`src/logging.rs` | 无业务逻辑 | `cargo build` + 启动/优雅退出冒烟 |
 | P1 | `plan/04-p1-config.md` | 配置解析与校验 | `src/config/{mod,forward,openstack}.rs` | 解析正反例、校验规则、`${ENV}` 展开、secret 打码 | 单测全绿 |
 | P2 | `plan/05-p2-routing.md` | 路由与域名匹配 | `src/routing.rs` | `normalize_host`、`parse_instance_host`、查找优先级 | 单测全绿 |
-| P3 | `plan/06-p3-forward.md` | forward 转发链路 + 最小 Server | `src/lb.rs`、`src/proxy.rs`、`src/main.rs` | 算法映射、后端解析、健康检查状态机 | 单测 + 双后端端到端 curl |
-| P4 | `plan/07-p4-tls-sni.md` | TLS/SNI 与 H2 | `src/tls.rs`、`src/main.rs` | SNI 选择器映射（纯逻辑） | `openssl s_client` 证书/H2/421 |
+| P3 | `plan/06-p3-forward.md` | forward 转发链路 + 最小 Server | `src/lb.rs`、`src/proxy.rs`、`src/main.rs`、`src/state.rs`（首创 config/routing/lbs） | 算法映射、后端解析、健康检查状态机 | 单测 + 双后端端到端 curl |
+| P4 | `plan/07-p4-tls-sni.md` | TLS/SNI 与 H2 | `src/tls.rs`、`src/main.rs`、`src/state.rs`（+certs） | SNI 选择器映射（纯逻辑） | `openssl s_client` 证书/H2/421/openstack 通配 |
 | P5 | `plan/08-p5-openstack.md` | OpenStack 发现 | `src/openstack/{mod,auth,nova,cache}.rs` | token 生命周期、地址选择、缓存/单飞/熔断/fail-open | 单测 + mock Nova 集成 |
 | P6 | `plan/09-p6-firewall.md` | 防火墙 ACL | `src/firewall.rs` | role 解析、判定顺序表驱动 | 单测全绿（含 IPv6/CIDR） |
-| P7 | `plan/10-p7-orchestration.md` | openstack/firewall 编排 | `src/proxy.rs`、`src/main.rs`、`src/openstack/mod.rs` | 编排分支单测 | mock Nova + curl 200/403/404/502 |
-| P8 | `plan/11-p8-reload.md` | reload 与生命周期 | `src/reload.rs`、`src/main.rs`、`src/state.rs` | 重载状态机、配置指纹 | SIGHUP 热重载端到端、优雅关闭 |
+| P7 | `plan/10-p7-orchestration.md` | openstack/firewall 编排 | `src/proxy.rs`、`src/main.rs`、`src/openstack/mod.rs`、`src/state.rs`（+firewall/resolvers） | 编排分支单测 | mock Nova + curl 200/403/404/502 |
+| P8 | `plan/11-p8-reload.md` | reload 与生命周期 | `src/reload.rs`、`src/main.rs`（`src/state.rs` 前序已建，仅使用） | 重载状态机、配置指纹 | SIGHUP 热重载端到端、优雅关闭 |
+
+> `src/state.rs` 由 P3 首创并逐步增量加字段（P4 加 `certs`、P7 加 `firewall`/`resolvers`），纯增量不视为接口变更，见 `02-contracts.md`。
 
 ## 3. 配套文件
 

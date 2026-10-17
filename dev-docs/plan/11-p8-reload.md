@@ -1,13 +1,13 @@
 # P8 — reload 与生命周期
 
 - **依赖**：P7 完成。
-- **文件范围**：`src/state.rs`（`SharedState`）、`src/reload.rs`（`ReloadService`）、`src/main.rs`（信号接线 + 指标服务）。
+- **文件范围**：`src/reload.rs`（`ReloadService`/`apply_new_config`）、`src/main.rs`（信号接线 + 指标服务）。`src/state.rs` 已在 P3 首创、P4(P7) 增字段，本阶段**不再改字段**，仅使用。
 - **设计参考**：`reload.md` 全部、`design.md` §4.8/§9。
 
 ## 目标
-- `SharedState`（`02-contracts.md`）：config/routing/certs/firewall `ArcSwap`；lbs/resolvers `Arc<HashMap<...>>`。
+- `SharedState`（`02-contracts.md`；config/routing/lbs/certs/firewall/resolvers 全部字段已由前序阶段创建，本阶段只使用）。
 - `ReloadService` 实现 `BackgroundService`：
-  - 监听来源：`SIGHUP`（`iris reload` 发）与 `--watch-config` 时的目录变化（`notify`，debounce）；
+  - 监听来源：`SIGHUP`（`iris reload` 发；**按 P0 API 探针结论**——若 Pingora `run_forever` 未接管 SIGHUP，本阶段用 tokio `SignalKind::hangup()` 注册触发，防止缺省行为杀进程）与 `--watch-config` 时的目录变化（`notify`，debounce）；
   - 触发 `apply_new_config(state, cfg)`：`load_config` 校验 → **失败保持旧配置**（日志 + 指标）→ 成功则：
     - forward LB：后端集合变化 → `lb.update()`；算法变化 → 重建 LB 整体替换；
     - `ArcSwap` 原子换 routing/certs/firewall；

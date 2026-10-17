@@ -61,27 +61,27 @@
 ```
 
 - 全进程共享两个监听器：`0.0.0.0:80`（纯 HTTP）与 `0.0.0.0:443`（TLS）。站点不是独立监听器，而是同一监听器内的**虚拟主机路由**（`Host`/SNI → 站点）。这是多站点证书热换与 `reload` 的前提：站点增删只改路由表，不碰监听器。
-- 站点是否启用 HTTPS 由站点配置决定：`https` 关闭的站点只在 80 上可达；`https` 开启的站点需提供证书，443 握手时按 SNI 选择证书。HTTPS 请求命中未配置证书的站点 → 返回 HTTP 421（Misdirected Request）。
+- 站点是否启用 HTTPS 由站点配置决定：`https` 关闭的站点只在 80 上可达；`https` 开启的站点需提供证书，443 握手时按 SNI 选择证书——forward 用精确域名；openstack 以 `base_domain` 通配（需 operator 提供 `*.base_domain` 通配证书）。**SNI 无任何站点证书匹配 → 中断 TLS 握手**（TLS 层无法回 HTTP 状态码）；仅当 **TLS 已建立** 且请求 `Host` 命中的站点 `https=false`（或于 SNI 不一致）时返回 HTTP 421（Misdirected Request）。
 
 ## 4. 核心组件与职责
 
 ### 4.1 Server 装配（`main.rs`）
 
-按 Pingora 0.9 语义装配：`Server::bootstrap()` → 设置 `ServerConf`（`grace_period_seconds`、`graceful_shutdown_timeout_seconds`、`version: 1`）→ `add_service` 注册各 Service：
+按 Pingora 0.9 语义装配：`Server::bootstrap()` → 设置 `ServerConf`（`grace_period_seconds`、`graceful_shutdown_timeout_seconds`、`version: 1`）→ 构建代理服务 `http_proxy_service(&server.configuration, app)` 并向该服务挂监听（**不是** `server.add_listener`；精确装配方式以 P0 API 探针为准）→ `add_service` 注册各 Service：
 
-- HTTP 代理服务（`add_listener("0.0.0.0:80")`）
-- TLS 代理服务（`add_tls_with_settings("0.0.0.0:443", ..., TlsSettings)`）
+- HTTP 监听：`svc.add_tcp("0.0.0.0:80")`
+- TLS 监听：`svc.add_tls_with_settings("0.0.0.0:443", None, tls_settings)`（第二个参数为 `TcpSocketOptions`，默认 None）
 - 健康检查服务、配置监视服务、Prometheus 服务（`pingora_prometheus::prometheus_http_service()`）
 - `run_forever()`，由信号驱动关闭：
   - SIGTERM → 优雅关闭（排干在途请求，超时由 `graceful_shutdown_timeout_seconds` 控制）
   - SIGQUIT → 优雅升级（需要 `--upgrade` + `upgrade_sock`，移植自 Pingora）
   - SIGINT → 快速关闭
-  - SIGHUP → 进程内热重载（见 `reload.md`）
+  - SIGHUP → 进程内热重载（见 `reload.md`；SIGHUP 是否被 Pingora 接管由 P0 探针确认——若缺省行为会杀进程，则由 reload 服务自建 tokio `SignalKind::hangup()` 处理器）
 
 ### 4.2 TLS 与 SNI 证书选择（`tls.rs`）
 
 - 使用 `TlsSettings::with_callbacks(...)` + 实现 Pingora `TlsAccept` 的回调（0.9 不再提供 0.1 时代的 `with_sni_dynamic`/`SniCallback`）。
-- 回调 `certificate_callback(&mut SslRef)`：从 `SslRef::servername()` 取 SNI → 查 `ArcSwap<HashMap<Domain, Arc<CertKey>>>` 当前快照 → `ext::ssl_use_certificate` + `ext::ssl_use_private_key` 装配证书；未命中 → 中断握手。
+- 回调 `certificate_callback(&self, &mut SslRef)`（`TlsAccept` 只读 `&self`，证书表经 `ArcSwap` 共享）：从 `SslRef::servername()` 取 SNI → 查 `ArcSwap<SniCertMap>` 当前快照（`SniCertMap { exact: HashMap<Domain, Arc<CertKey>>, bases: Vec<(base_domain, Arc<CertKey>)> }`）→ `ext::ssl_use_certificate` + `ext::ssl_use_private_key` 装配证书；查找规则：精确命中 `exact` → 否则后缀匹配最长 `base_domain`（openstack 站点）；均未命中 → 中断握手。
 - 启用 `enable_h2()`（H2/H1 ALPN）。
 - 证书表在 `reload` 时整体换新（新请求/握手即可见新证书，旧连接不受影响）。
 - 归一化：同一域名大小写统一为小写后作 key；同时将域名本身加入路由快照，供 `upstream_peer` 使用。

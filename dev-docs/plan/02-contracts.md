@@ -51,8 +51,10 @@ pub enum AclReason { NoRole, PortNotAllowed(u16), Blacklisted(IpAddr), NotWhitel
 pub fn build_firewall(dir: &Path) -> Result<FirewallTable, ConfigError>;
 impl FirewallTable { pub fn check(&self, instance: &str, port: u16, client: IpAddr) -> AclVerdict; }
 
-// src/openstack/mod.rs
-pub struct OpenStackResolver;                                        // Arc 持有：client/cache/单飞/熔断/last-known-good
+// src/openstack/mod.rs — 注入缝（P7 单测用，OpenStackResolver 实现之）
+#[async_trait]
+pub trait Resolver { async fn resolve(&self, instance: &str) -> Result<ResolvedInstance, ResolveError>; }
+pub struct OpenStackResolver;                                        // Arc 持有：client/cache/单飞/熔断/last-known-good；实现 Resolver
 pub struct ResolvedInstance { pub floating: Option<IpAddr>, pub fixed: Option<IpAddr> }
 pub enum ResolveError { NotFound, AuthFailed, DiscoveryUnavailable(String), NoAddress }
 impl OpenStackResolver {
@@ -67,27 +69,39 @@ pub fn decode_server_list(body: &[u8]) -> Result<Vec<NovaServer>, NovaError>;
 pub fn exact_name_match<'a>(name: &str, servers: &'a [NovaServer]) -> Option<&'a NovaServer>;
 pub fn select_address(s: &NovaServer) -> AddressSelection;           // floating 优先 → fixed → None
 
-// src/lb.rs
-pub fn build_lb(backends: &[Backend], mode: &LbMode) -> Arc<LoadBalancer>;
-pub fn health_check_service(lb: Arc<LoadBalancer>, hc: &HealthCheck) -> impl BackgroundService;
+// src/lb.rs — 内部包装 Pingora LoadBalancer<T>；T 与 weight 字段形态以 P0 探针实测为准
+pub enum LbEngine { RR(...), Random(...), Ketama(...) }              // 分别包 LoadBalancer<RoundRobin>/<Random>/<Consistent>
+impl LbEngine {
+    pub fn select(&self, hash_key: Option<IpAddr>) -> Option<SocketAddr>; // ketama 用客户端 IP 作 hash 键；其余忽略
+    pub fn update(&self, backends: &[Backend]);                       // 委托底层 lb.update()（原子换表）
+}
+pub fn build_lb(backends: &[Backend], mode: &LbMode) -> Arc<LbEngine>;
+pub fn health_check_service(lb: Arc<LbEngine>, hc: &HealthCheck) -> impl BackgroundService;
 
 // src/proxy.rs
 pub struct Ctx { pub route: Option<RouteTarget>, pub upstream: Option<SocketAddr>,
                  pub site: Option<String>, pub instance: Option<String> }
 pub struct IrisProxy { pub shared: Arc<SharedState> }                 // SharedState 见 P8
 
-// src/tls.rs
-pub struct SniCertSource { certs: ArcSwap<HashMap<String, Arc<CertKey>>> }   // 实现 TlsAccept
-impl SniCertSource { pub fn from_sites(sites: &[&ForwardSite], base: &Path) -> Result<Self>; }
+// src/tls.rs — 证书映射：forward 站点(https) 进 exact；openstack 站点(https) 进 bases（需通配证书 *.base_domain）
+pub struct SniCertMap { exact: HashMap<String, Arc<CertKey>>, bases: Vec<(String, Arc<CertKey>)> }
+pub struct SniCertSource { certs: ArcSwap<SniCertMap> }              // 实现 TlsAccept
+impl SniCertSource {
+    pub fn from_sites(config: &Config) -> Result<Self>;
+    // lookup(sni)：精确命中 exact → 否则后缀匹配最长 base_domain（取该站点证书）→ 均未命中中断握手
+}
 
-// src/state.rs / src/reload.rs（P8）
+// src/state.rs —— 首创于 P3（config/routing/lbs）；字段由各阶段增量添加 = 纯增量，不视为接口变更
+//   P4 加 certs；P7 加 firewall/resolvers
 pub struct SharedState { pub config: ArcSwap<Config>, pub routing: ArcSwap<RoutingTable>,
-                         pub certs: ArcSwap<HashMap<String, Arc<CertKey>>>,
+                         pub certs: ArcSwap<SniCertMap>,
                          pub firewall: ArcSwap<FirewallTable>,
-                         pub lbs: Arc<HashMap<String, Arc<LoadBalancer>>>,
-                         pub resolvers: Arc<HashMap<String, Arc<OpenStackResolver>>> }
+                         pub lbs: ArcSwap<HashMap<String, Arc<LbEngine>>>,
+                         pub resolvers: ArcSwap<HashMap<String, Arc<dyn Resolver>>> }
+// src/reload.rs（P8）
 pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadError>;
 ```
 
-- 并发策略：所有共享快照经 `ArcSwap`；LB 集合热更走 `lb.update()`；`OpenStackResolver` 重建后整体替换。
+- 并发策略：所有共享快照经 `ArcSwap` 全量替换（含 lbs/resolvers）；LB 集合热更走 `lb.update()`；`OpenStackResolver` 重建后整体替换。
 - P1 实现落定真实签名时，若与上述有出入，视为设计变更，必须回报工作流管理器后再改，不得静默偏离。
+- 说明：(1) `src/state.rs` 由 P3 首创并逐步加字段，P4/P7 追加（纯增量）；(2) `LbEngine` 内层 Pingora 泛型、weight 字段、`update()` 可变性经 P0 探针（`03-p0-scaffold.md` §API 探针）实测后由 P3 落定，不视为改签。
