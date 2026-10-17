@@ -32,8 +32,6 @@ fn ip(s: &str) -> IpAddr {
 #[test]
 fn valid_allow_permits_open_ports_and_any_non_blacklisted_client() {
     let (_dir, table) = build_from(&["valid-allow.role"]).expect("valid fixture builds");
-    assert_eq!(table.roles["valid-allow"].allowed_ports, vec![80, 443]);
-    assert!(table.roles["valid-allow"].whitelist.is_empty());
     assert_eq!(
         table.check("valid-allow", 80, ip("203.0.113.9")),
         AclVerdict::Allow
@@ -51,7 +49,6 @@ fn valid_allow_permits_open_ports_and_any_non_blacklisted_client() {
 #[test]
 fn deny_all_fixture_denies_every_port() {
     let (_dir, table) = build_from(&["deny-all.role"]).expect("valid fixture builds");
-    assert!(table.roles["deny-all"].allowed_ports.is_empty());
     assert_eq!(
         table.check("deny-all", 80, ip("203.0.113.9")),
         AclVerdict::Deny(AclReason::PortNotAllowed(80))
@@ -64,15 +61,15 @@ fn blacklist_fixture_denies_cidr_plain_and_ipv6() {
     // Must open the port first for the blacklist branch to be reached.
     assert_eq!(
         table.check("blacklist", 80, ip("203.0.113.42")),
-        AclVerdict::Deny(AclReason::Blacklisted)
+        AclVerdict::Deny(AclReason::Blacklisted(ip("203.0.113.42")))
     );
     assert_eq!(
         table.check("blacklist", 80, ip("10.0.0.5")),
-        AclVerdict::Deny(AclReason::Blacklisted)
+        AclVerdict::Deny(AclReason::Blacklisted(ip("10.0.0.5")))
     );
     assert_eq!(
         table.check("blacklist", 80, ip("2001:db8::1")),
-        AclVerdict::Deny(AclReason::Blacklisted)
+        AclVerdict::Deny(AclReason::Blacklisted(ip("2001:db8::1")))
     );
     assert_eq!(table.check("blacklist", 80, ip("10.0.0.6")), AclVerdict::Allow);
 }
@@ -87,7 +84,7 @@ fn whitelist_fixture_allows_members_and_denies_others() {
     assert_eq!(table.check("whitelist", 8080, ip("::1")), AclVerdict::Allow);
     assert_eq!(
         table.check("whitelist", 8080, ip("192.0.2.1")),
-        AclVerdict::Deny(AclReason::NotWhitelisted)
+        AclVerdict::Deny(AclReason::NotWhitelisted(ip("192.0.2.1")))
     );
 }
 

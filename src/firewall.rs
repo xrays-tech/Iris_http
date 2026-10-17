@@ -37,7 +37,7 @@ pub struct RoleRules {
 #[derive(Debug, Default)]
 pub struct FirewallTable {
     /// Rules by instance name (the `<instance>.role` file stem).
-    pub roles: HashMap<String, RoleRules>,
+    roles: HashMap<String, RoleRules>,
 }
 
 /// Why a request was denied.
@@ -48,9 +48,9 @@ pub enum AclReason {
     /// The target port is not in the instance's `allowed_ports`.
     PortNotAllowed(u16),
     /// The client IP matched the blacklist.
-    Blacklisted,
+    Blacklisted(IpAddr),
     /// A whitelist is configured and the client IP is not in it.
-    NotWhitelisted,
+    NotWhitelisted(IpAddr),
 }
 
 /// The outcome of an ACL evaluation.
@@ -234,11 +234,11 @@ impl FirewallTable {
             return AclVerdict::Deny(AclReason::PortNotAllowed(port));
         }
         if rules.blacklist.iter().any(|net| net.contains(&client)) {
-            return AclVerdict::Deny(AclReason::Blacklisted);
+            return AclVerdict::Deny(AclReason::Blacklisted(client));
         }
         if !rules.whitelist.is_empty() && !rules.whitelist.iter().any(|net| net.contains(&client))
         {
-            return AclVerdict::Deny(AclReason::NotWhitelisted);
+            return AclVerdict::Deny(AclReason::NotWhitelisted(client));
         }
         AclVerdict::Allow
     }
@@ -326,7 +326,7 @@ mod tests {
         let table = table("INS", rules(&[80], &["10.0.0.0/8"], &[]));
         assert_eq!(
             table.check("INS", 80, ip("192.168.1.1")),
-            AclVerdict::Deny(AclReason::NotWhitelisted)
+            AclVerdict::Deny(AclReason::NotWhitelisted(ip("192.168.1.1")))
         );
     }
 
@@ -335,7 +335,7 @@ mod tests {
         let table = table("INS", rules(&[80], &[], &["203.0.113.0/24"]));
         assert_eq!(
             table.check("INS", 80, ip("203.0.113.7")),
-            AclVerdict::Deny(AclReason::Blacklisted)
+            AclVerdict::Deny(AclReason::Blacklisted(ip("203.0.113.7")))
         );
     }
 
@@ -347,7 +347,7 @@ mod tests {
         );
         assert_eq!(
             table.check("INS", 80, ip("10.1.2.3")),
-            AclVerdict::Deny(AclReason::Blacklisted)
+            AclVerdict::Deny(AclReason::Blacklisted(ip("10.1.2.3")))
         );
     }
 
@@ -365,11 +365,11 @@ mod tests {
         let table = table("INS", rules(&[80], &[], &["192.168.1.0/24"]));
         assert_eq!(
             table.check("INS", 80, ip("192.168.1.0")),
-            AclVerdict::Deny(AclReason::Blacklisted)
+            AclVerdict::Deny(AclReason::Blacklisted(ip("192.168.1.0")))
         );
         assert_eq!(
             table.check("INS", 80, ip("192.168.1.255")),
-            AclVerdict::Deny(AclReason::Blacklisted)
+            AclVerdict::Deny(AclReason::Blacklisted(ip("192.168.1.255")))
         );
         assert_eq!(table.check("INS", 80, ip("192.168.2.0")), AclVerdict::Allow);
     }
@@ -386,7 +386,7 @@ mod tests {
         );
         assert_eq!(
             table.check("INS", 80, ip("11.0.0.0")),
-            AclVerdict::Deny(AclReason::NotWhitelisted)
+            AclVerdict::Deny(AclReason::NotWhitelisted(ip("11.0.0.0")))
         );
     }
 
@@ -400,11 +400,11 @@ mod tests {
         );
         assert_eq!(
             table.check("INS", 80, ip("172.32.0.0")),
-            AclVerdict::Deny(AclReason::NotWhitelisted)
+            AclVerdict::Deny(AclReason::NotWhitelisted(ip("172.32.0.0")))
         );
         assert_eq!(
             table.check("INS", 80, ip("172.15.255.255")),
-            AclVerdict::Deny(AclReason::NotWhitelisted)
+            AclVerdict::Deny(AclReason::NotWhitelisted(ip("172.15.255.255")))
         );
     }
 
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(table.check("INS", 80, ip("::1")), AclVerdict::Allow);
         assert_eq!(
             table.check("INS", 80, ip("::2")),
-            AclVerdict::Deny(AclReason::NotWhitelisted)
+            AclVerdict::Deny(AclReason::NotWhitelisted(ip("::2")))
         );
     }
 
@@ -426,7 +426,7 @@ mod tests {
         let table = table("INS", rules(&[80], &[], &["203.0.113.1"]));
         assert_eq!(
             table.check("INS", 80, ip("203.0.113.1")),
-            AclVerdict::Deny(AclReason::Blacklisted)
+            AclVerdict::Deny(AclReason::Blacklisted(ip("203.0.113.1")))
         );
         assert_eq!(table.check("INS", 80, ip("203.0.113.2")), AclVerdict::Allow);
     }
