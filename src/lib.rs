@@ -7,8 +7,13 @@
 
 pub mod config;
 pub mod errors;
+pub mod firewall;
+pub mod lb;
 pub mod logging;
+pub mod openstack;
+pub mod proxy;
 pub mod routing;
+pub mod state;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
