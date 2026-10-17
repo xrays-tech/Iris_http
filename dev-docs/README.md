@@ -1,6 +1,8 @@
-# Iris HTTP — 技术设计文档
+# Iris HTTP — 技术设计文档（含实现与验证记录）
 
-Rust + Pingora 的 HTTP/HTTPS 反向代理。需求来源：`propose.md`。
+Rust + Pingora 的 HTTP/HTTPS 反向代理。需求来源：`propose.md`。实现已按 TDD 分阶段完成（P0–P8），下述验证证据均为本仓库当前 HEAD（`9087975`）实测输出。
+
+## 设计文档
 
 | 文档 | 内容 |
 |---|---|
@@ -9,8 +11,40 @@ Rust + Pingora 的 HTTP/HTTPS 反向代理。需求来源：`propose.md`。
 | `discovery.md` | OpenStack 自动模式：Keystone 认证、Nova 查询、地址选择、1 天缓存、单飞/熔断/fail-open |
 | `firewall.md` | 防火墙规则：`INSTANCE.role` 格式、default-deny 判定顺序、白/黑名单语义 |
 | `reload.md` | `reload` 命令热重载、生效机制、信号与优雅关闭/升级、运维联动 |
-| `dev-plan.md` | 开发计划分步索引（入口：`plan/01-overview.md`） |
+| `plan/01-overview.md` | 开发计划入口（分步文件 `plan/03…13`、门禁 `plan/13-gates-risks.md`） |
 
 阅读顺序：`design.md` → `config.md` → `discovery.md` → `firewall.md` → `reload.md`。
 
 版本基线：Pingora 0.9.x（API 以 `cloudflare/pingora` main 2026-10 核对）；OpenStack 发现行为对齐 `xrays-tech/Iris_ssh`。
+
+## 运行
+
+```bash
+cargo build
+cargo run --bin iris -- run --config-dir <config-root>
+```
+
+- `<config-root>` 下必须含 `sites/` 子目录（默认 `--config-dir ./config`），每站点一个 `*.yaml`，示例见 `tests/fixtures/sites/`。
+- 监听：`0.0.0.0:80`（HTTP）、`0.0.0.0:443`（HTTPS/SNI/H2）。可用环境变量覆盖端口以便测试：
+  `IRIS_HTTP_LISTEN_ADDR`（默认 `0.0.0.0:80`）、`IRIS_HTTP_LISTEN_TLS_ADDR`（默认 `0.0.0.0:443`）、`IRIS_HTTP_METRICS_ADDR`（默认 `127.0.0.1:9091`）。
+- 指标与健康：metrics 端口提供 `/metrics`（prometheus，含 `config_reload_total{ok}`、`firewall_denied_total{reason}`）、`/healthz`、`/version`（`binary=<ver> config_hash=<hex>`）。
+- 热重载：`iris reload --pidfile <pidfile>`（缺省 `/run/iris/iris.pid`）向运行进程发 SIGHUP；配置校验失败保持旧配置生效；`--watch-config` 为可选轮询监视（默认关）。
+- 关闭：SIGTERM 优雅关闭；SIGQUIT/SIGINT 由 Pingora 处理（优雅升级/快速关闭）。
+
+## 验证证据（HEAD 9087975，2026-10-17）
+
+- `cargo build`：0 warnings / 0 errors。
+- `cargo test`：**278 passed / 0 failed**（lib 201、bin 7、config_load 49、firewall 11、openstack 10）。
+- 端到端（可复现脚本，全部 PASS）：
+  - `scripts/e2e/03-forward.sh` — 轮询/加权/随机/ketama 分发、健康检查剔除与恢复、未知域名 404；
+  - `scripts/e2e/04-tls.sh` — 按 SNI 选证书（CN/SAN）、ALPN h2、通配 `*.rent.do.top`、未知 SNI 握手失败、421、HTTP/2 200；
+  - `scripts/e2e/07-openstack.sh` — mock Keystone/Nova 全流程：200/403（未开放端口、未白名单、黑名单、无 role）/404/502、floating 故障回退 fixed、token 复用 1 次；
+  - `scripts/e2e/08-reload.sh` — 热重载增/改/删站点、坏配置保持旧配置、指纹变化、`/metrics`/`/healthz`/`/version`；
+  - `scripts/e2e/09-health-reload.sh` — 重载后健康检查状态保留（引擎复用，健康后端不被误选）。
+- 所有生产代码（`src/`）无 `unwrap()/expect()/panic!`（测试模块除外，已多次 grep 佐证）。
+
+## 测试/冒烟工具
+
+- `tests/stubs/upstream.py` — 可配端口/状态码/503/延迟/断连的 HTTP 上游桩。
+- `scripts/mock_openstack.py` — Keystone v3 + Nova 2.1 契约 mock（记录请求头供 token 复用断言）。
+- `scripts/gen-test-certs.sh` — 重新生成自签测试证书（`tests/fixtures/certs/`）。
