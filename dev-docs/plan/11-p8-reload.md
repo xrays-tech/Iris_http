@@ -41,7 +41,7 @@
 ### `apply_new_config(state, cfg)`（`src/reload.rs`）
 - **先建后换**：构建顺序 `routing → firewall → certificates → lbs → resolvers`；任一构建失败即返回 `ReloadError::Build{component, source}`，**不动任何已发布字段**（老配置继续服务）。全部成功后逐字段 `ArcSwap::store`（每字段原子，跨字段非原子；在途请求持有旧 `Arc` 快照，不存在半新状态）。
 - **resolver 缓存保留**：逐站点比较新旧 `OpenStackConfig`；相同者复用旧 `Arc<dyn Resolver>`（进程内 moka 缓存/熔断/last-known-good 全部保留），仅对变更站点 `OpenStackResolver::new` 重建。`src/openstack/*` 签名未动。
-- **LbEngine map 重建**：对每个 forward 站点 `build_lb(&backends, &lb_mode)` 新建后整表 `store`（对齐本阶段"重建 LB 映射"的钉定语义）。**已知局限**：P3 的健康检查后台服务在启动时持有初始 `Arc<LbEngine>`，其 `LbSlot::run` 在启动时载入一次 inner；`build_lb` 新引擎不带探针，故重载后 forward 健康探测不会自动指向新池（P3 `update()` 语义亦然）。P8 门禁未覆盖该场景，未在 `src/lb.rs` 内改动（超出本阶段独占文件范围）。
+- **LbEngine map 复用（后续修复）**：逐站点比较新旧 forward 站点的**池相关**配置（`backends` / `lb_mode` / `health_check`，逐字段精确比较）；完全相同者复用旧 `Arc<LbEngine>`（启动时注册的健康检查后台服务正持有该 `Arc`，复用即保留探针，重载后仍剔除下线后端），仅变更站点 `build_lb` 重建。配套地，`src/lb.rs` 内部改为**共享 `Arc<HealthRegistry>` + 可替换 discovery**：`LbEngine::update(backends)` 只替换成员集合，并对同一 `Backends` 重跑 `LoadBalancer::update()`，健康探针与已观测健康状态跨成员刷新保留（见 `src/lb.rs` 模块文档）。证明：`scripts/e2e/09-health-reload.sh`（重载后把后端重启为可连接但返回 `503`，断言其不再被选中——连不上会被重试掩盖，故必须用 503 观察选择本身）。
 - **指纹**：`config_fingerprint(&Config)` = 配置规范 `Debug` 渲染的 64-bit `DefaultHasher` 十六进制（稳定、内容敏感；`Debug` 已对凭据脱敏，故密钥轮换不改指纹——有意如此，避免 `/version` 泄露或噪声）。`state.fingerprint: ArcSwap<String>` 为 P8 追加字段（纯增量）。
 
 ### `ReloadService`（`BackgroundService`）
@@ -58,8 +58,8 @@
 - 无新依赖；`bytes` 通过 `into()` 类型推断构造，未引入 `bytes` 直接依赖。
 
 ### 测试
-- 单测：`reload.rs` 11 项（成功切换/构建失败全字段不变(Arc 指针比较)/幂等/指纹稳定与内容敏感/resolver 复用与重建/`reload_once` 成功与坏配置/ watch 无变更跳过/关闭收敛），`state.rs` +2（指纹稳定/内容敏感），`proxy.rs` +1（denial 标签与判决一致），`lib.rs` +1（`--metrics-listen` 解析）。
-- 全量 `cargo test`：**273 passed / 0 failed**（6 suites：lib 196、bin 7、config_load 49、firewall 11、openstack 10）。`cargo build` 0 warning。
+- 单测：`reload.rs` 14 项（成功切换/构建失败全字段不变(Arc 指针比较)/幂等/指纹稳定与内容敏感/resolver 复用与重建/未变 forward 站点复用 LB 引擎、变更 backends·lb_mode·health_check 重建/`reload_once` 成功与坏配置/ watch 无变更跳过/关闭收敛），`state.rs` +2（指纹稳定/内容敏感），`proxy.rs` +1（denial 标签与判决一致），`lib.rs` +1（`--metrics-listen` 解析），`lb.rs` +2（`update` 保留健康注册表 / 探针重复安装幂等）。
+- 全量 `cargo test`：**278 passed / 0 failed**（6 suites：lib 201、bin 7、config_load 49、firewall 11、openstack 10）。`cargo build` 0 warning。
 - 端到端 `scripts/e2e/08-reload.sh`：A 基线（alpha/openstack 200、`/healthz` ok、`/metrics` 可达含 `config_reload_total`）→ B（加 `beta.test` + 改 openstack 站点）reload → 新旧全 200、指纹 A→B 改变、`{ok="true"} 1` → C（坏 YAML）reload → 指纹不变、`{ok="false"} 1`、`beta.test` 仍 200 → D（删 `alpha.test`）reload → `alpha.test` 404、`beta.test` 200、`{ok="true"} 2`。
 - 回归：`03-forward.sh`、`04-tls.sh`、`07-openstack.sh` 全绿。
 - **WebSocket 跨重载**：本阶段未做（可选）。原因：需额外 WS 客户端且 Pingora 升级语义与 P8 热重载正交；已在门禁范围外，未添加 `tests/stubs/` 客户端。

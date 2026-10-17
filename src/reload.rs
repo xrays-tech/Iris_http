@@ -131,15 +131,37 @@ pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadEr
     let certs = SniCertMap::from_sites(&cfg)
         .map_err(|err| ReloadError::build("certificates", format!("{err:#}")))?;
 
-    let lbs: HashMap<String, Arc<LbEngine>> = cfg
-        .forward
-        .iter()
-        .map(|site| (site.name.clone(), build_lb(&site.backends, &site.lb_mode)))
-        .collect();
+    // The live config snapshot, used to decide what can be reused below. Held
+    // for the whole build phase (it is only an `Arc` snapshot).
+    let old_config = state.config.load();
+
+    // Forward load balancers: reuse the live engine for a forward site whose
+    // *pool-relevant* configuration (backends, algorithm, health check) is
+    // unchanged. The startup health-check service holds this exact
+    // `Arc<LbEngine>`, so reusing it keeps the attached probe gating selection
+    // after the reload; only a genuinely changed site gets a fresh engine (with
+    // a probe re-attached the same way startup does).
+    let mut lbs: HashMap<String, Arc<LbEngine>> = HashMap::with_capacity(cfg.forward.len());
+    for site in &cfg.forward {
+        let unchanged = old_config.forward.iter().any(|old| {
+            old.name == site.name
+                && old.backends == site.backends
+                && old.lb_mode == site.lb_mode
+                && old.health_check == site.health_check
+        });
+        let engine = if unchanged {
+            match state.lb(&site.name) {
+                Some(existing) => existing,
+                None => build_lb(&site.backends, &site.lb_mode),
+            }
+        } else {
+            build_lb(&site.backends, &site.lb_mode)
+        };
+        lbs.insert(site.name.clone(), engine);
+    }
 
     // Resolvers: reuse the live resolver for an openstack site whose
     // control-plane configuration is byte-for-byte unchanged.
-    let old_config = state.config.load();
     let client = Arc::new(HttpClient::new());
     let mut resolvers: HashMap<String, Arc<dyn Resolver>> =
         HashMap::with_capacity(cfg.openstack.len());
@@ -415,8 +437,8 @@ mod tests {
     use url::Url;
 
     use crate::config::{
-        AuthConfig, AuthCredentials, Backend, ForwardSite, LbMode, NovaConfig, OpenStackConfig,
-        OpenStackSite,
+        AuthConfig, AuthCredentials, Backend, ForwardSite, HealthCheck, HealthKind, LbMode,
+        NovaConfig, OpenStackConfig, OpenStackSite,
     };
 
     fn forward_site(name: &str, domain: &str, port: u16) -> ForwardSite {
@@ -646,6 +668,76 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&existing, &after),
             "a changed openstack site must rebuild its resolver"
+        );
+    }
+
+    // ----- forward LB reuse across a reload -----
+
+    #[test]
+    fn unchanged_forward_site_reuses_its_lb_engine() {
+        let state = own_state(config_a());
+        let before = state.lb("www").expect("www lb");
+
+        // Only the openstack site changes; www's pool / algorithm / health spec
+        // are equal, so its engine (and attached health probe) must be kept.
+        let mut next = config_a();
+        next.openstack[0].openstack.cache_ttl_secs = 43_200;
+        apply_new_config(&state, next).expect("apply");
+
+        let after = state.lb("www").expect("www lb");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged forward site must reuse its engine so its health probe survives"
+        );
+    }
+
+    #[test]
+    fn changed_forward_backends_rebuild_the_lb_engine() {
+        let state = own_state(config_a());
+        let before = state.lb("www").expect("www lb");
+
+        let mut changed = config_a();
+        changed.forward[0].backends[0].addr = SocketAddr::from(([127, 0, 0, 1], 18099));
+        apply_new_config(&state, changed).expect("apply");
+
+        let after = state.lb("www").expect("www lb");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a changed backend set must rebuild the engine"
+        );
+        assert_eq!(
+            after.select(None),
+            Some(SocketAddr::from(([127, 0, 0, 1], 18099)))
+        );
+    }
+
+    #[test]
+    fn changed_lb_mode_or_health_check_rebuilds_the_engine() {
+        // Algorithm change.
+        let state = own_state(config_a());
+        let before = state.lb("www").expect("www lb");
+        let mut mode_changed = config_a();
+        mode_changed.forward[0].lb_mode = LbMode::Random;
+        apply_new_config(&state, mode_changed).expect("apply");
+        assert!(
+            !Arc::ptr_eq(&before, &state.lb("www").expect("www lb")),
+            "a changed algorithm must rebuild the engine"
+        );
+
+        // Health-check change.
+        let state = own_state(config_a());
+        let before = state.lb("www").expect("www lb");
+        let mut health_changed = config_a();
+        health_changed.forward[0].health_check = Some(HealthCheck {
+            kind: HealthKind::Tcp,
+            http_path: None,
+            interval_secs: 5,
+            timeout_secs: 2,
+        });
+        apply_new_config(&state, health_changed).expect("apply");
+        assert!(
+            !Arc::ptr_eq(&before, &state.lb("www").expect("www lb")),
+            "a changed health check must rebuild the engine"
         );
     }
 
