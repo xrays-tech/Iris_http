@@ -195,7 +195,7 @@ impl LbEngine {
     /// round-robin and random ignore it.
     pub fn select(&self, hash_key: Option<IpAddr>) -> Option<SocketAddr> {
         let key = hash_key.map(ip_key_bytes);
-        let key = key.as_deref().unwrap_or(&[]);
+        let key = key.as_ref().map(IpKey::as_bytes).unwrap_or(&[]);
         match self {
             LbEngine::RR(slot) => slot.select(key),
             LbEngine::Random(slot) => slot.select(key),
@@ -512,11 +512,32 @@ fn pool_backend(backend: &Backend) -> Option<PoolBackend> {
     PoolBackend::new_with_weight(&backend.addr.to_string(), backend.weight as usize).ok()
 }
 
-/// The ketama hash key for a client address: the raw IP octets.
-fn ip_key_bytes(ip: IpAddr) -> Vec<u8> {
+/// A ketama select key built inline from a client address.
+///
+/// Holds the address octets on the stack (no heap) so a per-request selection
+/// allocates nothing; [`as_bytes`](Self::as_bytes) yields exactly the octets the
+/// previous `Vec::from(octets)` produced — 4 for IPv4, 16 for IPv6 (including
+/// IPv4-mapped IPv6, whose mapping is preserved unchanged).
+enum IpKey {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+impl IpKey {
+    /// The raw octets, borrowed from the inline buffer.
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            IpKey::V4(bytes) => bytes,
+            IpKey::V6(bytes) => bytes,
+        }
+    }
+}
+
+/// The ketama hash key for a client address: the raw IP octets, inline.
+fn ip_key_bytes(ip: IpAddr) -> IpKey {
     match ip {
-        IpAddr::V4(v4) => v4.octets().to_vec(),
-        IpAddr::V6(v6) => v6.octets().to_vec(),
+        IpAddr::V4(v4) => IpKey::V4(v4.octets()),
+        IpAddr::V6(v6) => IpKey::V6(v6.octets()),
     }
 }
 
@@ -804,7 +825,14 @@ mod tests {
 
     #[test]
     fn ip_key_bytes_uses_address_octets() {
-        assert_eq!(ip_key_bytes(IpAddr::from([10, 0, 0, 1])), vec![10, 0, 0, 1]);
-        assert_eq!(ip_key_bytes(IpAddr::from([0u16; 8])).len(), 16);
+        assert_eq!(ip_key_bytes(IpAddr::from([10, 0, 0, 1])).as_bytes(), &[10, 0, 0, 1]);
+        assert_eq!(ip_key_bytes(IpAddr::from([0u16; 8])).as_bytes().len(), 16);
+        // An IPv4-mapped IPv6 address keeps its 16-byte form (unchanged mapping).
+        assert_eq!(
+            ip_key_bytes(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 0, 0, 1]))
+                .as_bytes()
+                .len(),
+            16
+        );
     }
 }

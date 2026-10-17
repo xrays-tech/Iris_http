@@ -20,7 +20,6 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use url::Url;
 
@@ -244,7 +243,13 @@ pub struct OpenStackResolver {
     cache: DiscoveryCache,
     flights: FlightMap,
     breaker: Mutex<Breaker>,
-    last_good: ArcSwap<HashMap<String, ResolvedInstance>>,
+    /// Last-known-good address per instance, keyed by instance name.
+    ///
+    /// Entry-level storage (a keyed map behind one short-lived lock) so a
+    /// positive resolution inserts only its own entry instead of cloning the
+    /// whole map, which was O(n) per success at large instance counts. The
+    /// fail-open path only ever needs the entry for the instance being resolved.
+    last_good: Mutex<HashMap<String, ResolvedInstance>>,
 }
 
 impl OpenStackResolver {
@@ -270,7 +275,7 @@ impl OpenStackResolver {
             cache: build_cache(),
             flights: FlightMap::new(),
             breaker: Mutex::new(Breaker::new(BREAKER_THRESHOLD, cooldown)),
-            last_good: ArcSwap::from_pointee(HashMap::new()),
+            last_good: Mutex::new(HashMap::new()),
         }
     }
 
@@ -383,11 +388,12 @@ impl OpenStackResolver {
 
     async fn store_positive(&self, instance: &str, resolved: ResolvedInstance) {
         self.store_entry(instance, CacheEntry::Positive(resolved)).await;
-        self.last_good.rcu(|map| {
-            let mut next = (**map).clone();
-            next.insert(instance.to_owned(), resolved);
-            next
-        });
+        // Per-instance insert: no whole-map copy. The lock is taken and released
+        // synchronously (never held across `.await`).
+        self.last_good
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(instance.to_owned(), resolved);
     }
 
     async fn store_entry(&self, instance: &str, entry: CacheEntry) {
@@ -398,7 +404,11 @@ impl OpenStackResolver {
     }
 
     fn last_good_of(&self, instance: &str) -> Option<ResolvedInstance> {
-        self.last_good.load().get(instance).copied()
+        self.last_good
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(instance)
+            .copied()
     }
 }
 
@@ -656,6 +666,46 @@ mod tests {
             resolver.resolve("web").await.unwrap().floating,
             Some(ipv4([10, 0, 0, 9])),
             "a control-plane blip serves the last-known-good address"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_known_good_is_isolated_per_instance() {
+        let fetcher = Arc::new(FakeFetcher::new(Reply::Ok(inst([10, 0, 0, 1])), Duration::ZERO));
+        let resolver = resolver_with(fetcher.clone());
+
+        // Two instances, each with its own positive address.
+        assert_eq!(
+            resolver.resolve("a").await.unwrap().floating,
+            Some(ipv4([10, 0, 0, 1]))
+        );
+        fetcher.set_reply(Reply::Ok(inst([10, 0, 0, 2])));
+        assert_eq!(
+            resolver.resolve("b").await.unwrap().floating,
+            Some(ipv4([10, 0, 0, 2]))
+        );
+
+        // A later failure on `a` serves `a`'s OWN last-known-good, not `b`'s:
+        // the per-instance store must not have been disturbed by `b`'s success.
+        resolver.invalidate("a").await;
+        fetcher.set_reply(Reply::Transient);
+        assert_eq!(
+            resolver.resolve("a").await.unwrap().floating,
+            Some(ipv4([10, 0, 0, 1])),
+            "instance a must keep its own last-known-good"
+        );
+
+        // ...and `b` still holds its own entry, undisturbed.
+        assert_eq!(
+            resolver.last_good_of("b").map(|resolved| resolved.floating),
+            Some(Some(ipv4([10, 0, 0, 2]))),
+            "instance b's last-known-good must be untouched"
+        );
+        resolver.invalidate("b").await;
+        assert_eq!(
+            resolver.resolve("b").await.unwrap().floating,
+            Some(ipv4([10, 0, 0, 2])),
+            "instance b must keep its own last-known-good"
         );
     }
 
