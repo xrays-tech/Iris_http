@@ -11,6 +11,7 @@ Rust + Pingora 的 HTTP/HTTPS 反向代理。需求来源：`propose.md`。实�
 | `discovery.md` | OpenStack 自动模式：Keystone 认证、Nova 查询、地址选择、1 天缓存、单飞/熔断/fail-open |
 | `firewall.md` | 防火墙规则：`INSTANCE.role` 格式、default-deny 判定顺序、白/黑名单语义 |
 | `reload.md` | `reload` 命令热重载、生效机制、信号与优雅关闭/升级、运维联动 |
+| `ops-deploy.md` | 部署与运维：systemd unit、证书零停机轮换、配置/防火墙变更、排障 |
 | `plan/01-overview.md` | 开发计划入口（分步文件 `plan/03…13`、门禁 `plan/13-gates-risks.md`） |
 
 阅读顺序：`design.md` → `config.md` → `discovery.md` → `firewall.md` → `reload.md`。
