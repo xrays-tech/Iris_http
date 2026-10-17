@@ -30,7 +30,7 @@ config/
 | `mode` | enum | 是 | `forward` \| `openstack` |
 | `http` | 布尔 | 否 | 是否响应 HTTP（80 端口），默认 `true` |
 | `https` | 布尔 | 是 | 是否启用 HTTPS（443 端口） |
-| `listen.http_port` / `listen.https_port` | int | 否 | 全局默认 80/443；允许测试环境改端口（生产部署保持默认） |
+| `listen.http_port` / `listen.https_port` | int | 否 | v1 不接受：监听固定共享 `0.0.0.0:80`/`0.0.0.0:443`（design.md §4.1；测试换端口在 main 装配层进行，不进配置） |
 
 `https: true` 时必须提供 `cert_file` + `key_file`（PEM）。证书由共享 443 监听器按 SNI 选择（见 `design.md` §4.2）。
 
@@ -94,14 +94,13 @@ openstack:
     # application_credential_secret: ...
   nova:
     api_url: https://controller.example.com:8774/v2.1 # 可选，缺省由 catalog 发现
-    all_tenants: true            # 全局查找实例（跨项目）所需
-    timeout_secs: 5
+    all_tenants: true            # 全局查找实例（跨项目）所需（Nova 请求超时用顶层 timeout_secs）
 ```
 
 - `base_domain`：openstack 站点的根域；形如 `{instance}-{port}.{base_domain}` 的 Host 命中（§8 解析规则）。
 - `firewall_dir`：可选。**配置后即强制执行** ACL（无 role 或端口未开放 → 拒绝）；未配置则不校验（见 `firewall.md` §4 的决策说明）。
 - `auth.api_url` 为 Keystone 版本端点（`/v3`）。`nova.api_url` 缺省时用 token 响应中的服务目录（`nova` 服务 / `compute` 类型 / 匹配 region）发现，与 Iris_ssh 的 `nova_base_from_catalog` 一致。
-- 凭据永不写入站点文件明文：secret 一律走 `${ENV}`（§7），不支持字面量密钥。
+- 凭据不得写入站点文件明文：secret 推荐一律走 `${ENV}`（§7）；字面量值亦会被解析（无法在展开后可靠区分），属运维规范违规；日志与 `Debug` 永不落任何 secret。
 - `cache_ttl_secs` 默认 86400（1 天）；负缓存与瞬时错误 TTL 为固定值（见 `discovery.md`）。
 
 ## 5. 负载均衡模式枚举（仅 forward）
@@ -133,8 +132,8 @@ openstack:
 
 ## 7. 敏感信息与环境变量展开
 
-- 站点文件内不得出现明文 secret。
-- 支持 `${ENV_NAME}` 展开（在解析阶段完成，结果不进日志、不参与 `Debug` 输出——`SiteConfig` 实现自定义 `Debug` 对 secret 打码，参照 Iris_ssh 的 redacted `Debug`）。
+- 站点文件内不得出现明文 secret：secret 一律推荐 `${ENV_NAME}` 展开；字面量值亦接受（无法在展开后可靠区分），仅作兼容、运维规范要求走 `${ENV}`。
+- `${ENV_NAME}` 展开在解析阶段完成，结果不进日志、不参与 `Debug` 输出——`SiteConfig` 实现自定义 `Debug` 对 secret 打码（参照 Iris_ssh 的 redacted `Debug`）。
 - 未知变量 → 加载失败。
 
 ## 8. 域名匹配规则

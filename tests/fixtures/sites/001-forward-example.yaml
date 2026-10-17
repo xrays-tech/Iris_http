@@ -1,0 +1,19 @@
+name: www-example
+mode: forward
+domain: www.example.com
+http: true
+https: true
+cert_file: tests/fixtures/certs/www.example.com.crt
+key_file: tests/fixtures/certs/www.example.com.key
+
+backends:
+  - addr: 10.0.0.5:8080
+    weight: 3
+  - addr: 10.0.0.6:8080
+
+load_balancer: weighted_round_robin
+health_check:
+  kind: http
+  http_path: /healthz
+  interval_secs: 5
+  timeout_secs: 2

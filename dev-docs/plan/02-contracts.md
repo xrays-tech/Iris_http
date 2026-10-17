@@ -24,7 +24,8 @@ pub struct OpenStackSite {
 }
 pub struct OpenStackConfig { pub cache_ttl_secs: u64, pub timeout_secs: u64,
     pub auth: AuthConfig, pub nova: NovaConfig }
-pub enum AuthConfig { Password{ username: String, password: String, project_name: String,
+pub struct AuthConfig { pub api_url: Url, pub credentials: AuthCredentials }  // api_url = Keystone v3 基地址 https://...:5000/v3
+pub enum AuthCredentials { Password{ username: String, password: String, project_name: String,
                               project_domain_name: String, user_domain_name: String },
                       ApplicationCredential{ id: String, secret: String } }
 pub struct NovaConfig { pub api_url: Option<Url>, pub all_tenants: bool }
@@ -64,6 +65,7 @@ impl OpenStackResolver {
 // src/openstack/auth.rs
 pub struct Token { pub value: String, pub expires_at: DateTime<Utc>, pub nova_base: Url }
 pub async fn fetch_token(cfg: &AuthConfig, api_url: &Url, client: &HttpClient) -> Result<Token, AuthError>;
+// 调用点：fetch_token(&site.auth, &site.auth.api_url, client)
 // src/openstack/nova.rs
 pub fn decode_server_list(body: &[u8]) -> Result<Vec<NovaServer>, NovaError>;
 pub fn exact_name_match<'a>(name: &str, servers: &'a [NovaServer]) -> Option<&'a NovaServer>;

@@ -5,6 +5,7 @@
 //! a running server. The binary entry point (`src/main.rs`) owns the Pingora
 //! assembly and process lifecycle.
 
+pub mod config;
 pub mod errors;
 pub mod logging;
 
@@ -15,8 +16,11 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::errors::AppError;
 
-/// Default configuration directory (`--config-dir`).
-pub const DEFAULT_CONFIG_DIR: &str = "./sites";
+/// Default configuration root directory (`--config-dir`).
+///
+/// Per `config.md` §1 this is the *root*: site files live in its `sites/`
+/// subdirectory (e.g. `./config/sites`), not directly in `--config-dir`.
+pub const DEFAULT_CONFIG_DIR: &str = "./config";
 
 /// Default pidfile for `iris reload` (see `reload.md` §1).
 pub const DEFAULT_PIDFILE: &str = "/run/iris/iris.pid";
@@ -42,7 +46,8 @@ pub enum Command {
 /// Arguments for `iris run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Directory containing the site configuration files.
+    /// Configuration root directory; site files are read from its `sites/`
+    /// subdirectory (`config.md` §1).
     #[arg(long, value_name = "DIR", default_value = DEFAULT_CONFIG_DIR)]
     pub config_dir: PathBuf,
 
@@ -139,7 +144,7 @@ mod tests {
         let cli = parse_cli_from(["iris", "run"]).expect("run parses");
         match cli.command {
             Command::Run(args) => {
-                assert_eq!(args.config_dir, PathBuf::from("./sites"));
+                assert_eq!(args.config_dir, PathBuf::from("./config"));
                 assert_eq!(args.pidfile, None);
                 assert!(!args.watch_config);
             }

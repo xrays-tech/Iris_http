@@ -5,6 +5,7 @@
 //! OpenStack discovery arrive in later stages; the placeholder [`ScaffoldProxy`]
 //! therefore rejects every request with 503 rather than pretending to proxy.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -17,6 +18,7 @@ use pingora::server::Server;
 use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result as PingoraResult};
 
+use iris_http::config::load_config;
 use iris_http::logging;
 use iris_http::{reload, Cli, Command, RunArgs};
 
@@ -81,15 +83,26 @@ fn main() -> ExitCode {
 fn run(args: RunArgs) -> anyhow::Result<()> {
     logging::init(true).map_err(|e| anyhow::anyhow!("failed to initialise logging: {e}"))?;
 
-    // Design `reload.md` §6: an explicit (or default) config dir must exist;
-    // a missing one is a startup failure, not a silent fallback. P0 has no
-    // loader yet, so existence is the only check available; P1 replaces this.
+    // Design `reload.md` §6 + `config.md` §1: `--config-dir` is the configuration
+    // *root* and site files live in its `sites/` subdirectory. A missing root (or
+    // missing `sites/`) is a startup failure, not a silent fallback.
+    let sites_dir = args.config_dir.join("sites");
     if !args.config_dir.is_dir() {
         anyhow::bail!(
             "config directory '{}' does not exist or is not a directory (--config-dir)",
             args.config_dir.display()
         );
     }
+    if !sites_dir.is_dir() {
+        anyhow::bail!(
+            "sites directory '{}' does not exist or is not a directory (expected '<config-dir>/sites')",
+            sites_dir.display()
+        );
+    }
+
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let config = load_config(&sites_dir, &env)
+        .map_err(|err| anyhow::anyhow!("failed to load configuration: {err}"))?;
 
     if let Some(pidfile) = &args.pidfile {
         write_pidfile(pidfile)?;
@@ -97,6 +110,9 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
 
     tracing::info!(
         config_dir = %args.config_dir.display(),
+        sites_dir = %sites_dir.display(),
+        forward_sites = config.forward.len(),
+        openstack_sites = config.openstack.len(),
         watch_config = args.watch_config,
         version = env!("CARGO_PKG_VERSION"),
         "starting iris"
