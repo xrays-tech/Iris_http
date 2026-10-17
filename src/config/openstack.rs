@@ -16,6 +16,11 @@ use super::{expand_env, is_valid_hostname, site_error, ConfigError};
 pub(crate) const MIN_CACHE_TTL_SECS: u64 = 60;
 /// Upper bound for `openstack.cache_ttl_secs`: 7 days.
 pub(crate) const MAX_CACHE_TTL_SECS: u64 = 7 * 86_400;
+/// Lower bound for `openstack.timeout_secs` (`config.md` §4): a zero-second
+/// timeout would fail every Nova request instantly (permanent 502).
+pub(crate) const MIN_TIMEOUT_SECS: u64 = 1;
+/// Upper bound for `openstack.timeout_secs`: 10 minutes.
+pub(crate) const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// An `openstack` site: wildcard sub-domain match resolved via Nova.
 pub struct OpenStackSite {
@@ -306,6 +311,15 @@ pub(crate) fn parse(
             ),
         ));
     }
+    if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&os.timeout_secs) {
+        return Err(site_error(
+            file,
+            format!(
+                "site '{}': timeout_secs {} out of range {}..={}",
+                raw.name, os.timeout_secs, MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+            ),
+        ));
+    }
 
     let auth = parse_auth(os.auth, &raw.name, file, env)?;
 
@@ -455,3 +469,64 @@ fn expand_path(
         Some(value) => Ok(Some(PathBuf::from(expand_env(value, env)?))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal, otherwise-valid raw openstack site with the given timeout.
+    fn raw(timeout_secs: u64) -> RawOpenStackSite {
+        RawOpenStackSite {
+            name: "rent".to_owned(),
+            mode: "openstack".to_owned(),
+            base_domain: "rent.do.top".to_owned(),
+            http: true,
+            https: false,
+            cert_file: None,
+            key_file: None,
+            firewall_dir: None,
+            openstack: RawOpenStackConfig {
+                cache_ttl_secs: 86_400,
+                timeout_secs,
+                auth: RawAuth {
+                    api_url: Some("https://controller.example.com:5000/v3".to_owned()),
+                    approach: "application_credential".to_owned(),
+                    username: None,
+                    password: None,
+                    project_name: None,
+                    project_domain_name: None,
+                    user_domain_name: None,
+                    application_credential_id: Some("id".to_owned()),
+                    application_credential_secret: Some("secret".to_owned()),
+                },
+                nova: RawNova {
+                    api_url: None,
+                    all_tenants: true,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn timeout_secs_out_of_range_is_rejected() {
+        let file = Path::new("sites/001-openstack.yaml");
+        let env = HashMap::new();
+
+        // A zero timeout fails every Nova request instantly; reject it.
+        let err = parse(raw(0), file, &env).expect_err("timeout_secs = 0 must be rejected");
+        assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
+
+        let err = parse(raw(601), file, &env).expect_err("timeout_secs = 601 must be rejected");
+        assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn timeout_secs_accepts_the_inclusive_bounds() {
+        let file = Path::new("sites/001-openstack.yaml");
+        let env = HashMap::new();
+
+        assert!(parse(raw(MIN_TIMEOUT_SECS), file, &env).is_ok());
+        assert!(parse(raw(MAX_TIMEOUT_SECS), file, &env).is_ok());
+    }
+}
+
