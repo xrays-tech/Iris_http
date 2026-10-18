@@ -8,12 +8,16 @@
 mod forward;
 mod openstack;
 
-pub use forward::{Backend, ForwardSite, HealthCheck, HealthKind, LbMode};
-pub use openstack::{AuthConfig, AuthCredentials, NovaConfig, OpenStackConfig, OpenStackSite};
+pub use forward::{Backend, BackendTarget, ForwardSite, HealthCheck, HealthKind, LbMode};
+pub use openstack::{
+    load_openstack_envs, AuthConfig, AuthCredentials, NovaConfig, OpenStackConfig, OpenStackEnv,
+    OpenStackSite,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The fully loaded and validated site configuration.
 pub struct Config {
@@ -21,14 +25,24 @@ pub struct Config {
     pub forward: Vec<ForwardSite>,
     /// `openstack` sites, in load order.
     pub openstack: Vec<OpenStackSite>,
+    /// Standalone OpenStack environments, keyed by environment name (file stem).
+    ///
+    /// Loaded from `<config-dir>/openstack/<name>.yaml`; referenced by name from
+    /// openstack sites and from forward sites with instance backends.
+    pub openstack_envs: HashMap<String, Arc<OpenStackEnv>>,
 }
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `openstack` sites use their redacting Debug; no secret can leak here.
+        // `openstack` sites and environments use their redacting Debug; a
+        // secret can never leak here. `openstack_envs` is masked to its count so
+        // the (order-unstable) `HashMap` iteration cannot influence a rendering
+        // — `config_fingerprint` hashes each environment explicitly, sorted by
+        // name, instead.
         f.debug_struct("Config")
             .field("forward", &self.forward)
             .field("openstack", &self.openstack)
+            .field("openstack_envs", &self.openstack_envs.len())
             .finish()
     }
 }
@@ -106,13 +120,16 @@ struct ModeProbe {
     mode: String,
 }
 
-/// Load and validate every `*.yaml` site file under `sites_dir`.
+/// Load and validate every `*.yaml` site file under `sites_dir`, plus every
+/// standalone OpenStack environment under `envs_dir`.
 ///
 /// `env` supplies `${VAR}` expansion values (injected for testability). Any
-/// single file failure fails the whole load; the directory contents are read in
-/// sorted order so results are deterministic.
+/// single site or environment file failure fails the whole load; directory
+/// contents are read in sorted order so results are deterministic. A missing
+/// `envs_dir` means "no environments" (`Ok(empty)`).
 pub fn load_config(
     sites_dir: &Path,
+    envs_dir: &Path,
     env: &HashMap<String, String>,
 ) -> Result<Config, ConfigError> {
     if !sites_dir.is_dir() {
@@ -124,6 +141,10 @@ pub fn load_config(
             ),
         )));
     }
+
+    // Environments load first: a bad environment file fails the whole load
+    // before any site is parsed.
+    let openstack_envs = load_openstack_envs(envs_dir, env)?;
 
     let mut files: Vec<PathBuf> = Vec::new();
     let entries = std::fs::read_dir(sites_dir).map_err(|err| {
@@ -190,15 +211,20 @@ pub fn load_config(
         }
     }
 
-    validate_global(&forward, &openstack)?;
+    validate_global(&forward, &openstack, &openstack_envs)?;
 
-    Ok(Config { forward, openstack })
+    Ok(Config {
+        forward,
+        openstack,
+        openstack_envs,
+    })
 }
 
 /// Global cross-site validation (`config.md` §6).
 fn validate_global(
     forward: &[ForwardSite],
     openstack: &[OpenStackSite],
+    openstack_envs: &HashMap<String, Arc<OpenStackEnv>>,
 ) -> Result<(), ConfigError> {
     // 1. Unique site names.
     let mut names: HashSet<&str> = HashSet::with_capacity(forward.len() + openstack.len());
@@ -260,6 +286,26 @@ fn validate_global(
                     "forward domain '{domain}' overlaps openstack base_domain '{base}'"
                 )));
             }
+        }
+    }
+
+    // 5. Every `openstack_env` reference must name a loaded environment.
+    for site in forward {
+        if let Some(env_name) = &site.openstack_env {
+            if !openstack_envs.contains_key(env_name) {
+                return Err(ConfigError::Validate(format!(
+                    "forward site '{}': openstack_env '{}' does not exist",
+                    site.name, env_name
+                )));
+            }
+        }
+    }
+    for site in openstack {
+        if !openstack_envs.contains_key(&site.openstack_env) {
+            return Err(ConfigError::Validate(format!(
+                "openstack site '{}': openstack_env '{}' does not exist",
+                site.name, site.openstack_env
+            )));
         }
     }
 

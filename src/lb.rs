@@ -56,7 +56,7 @@ use pingora_load_balancing::{
     Backend as PoolBackend, Backends, HealthCheckService, HealthRegistry, LoadBalancer,
 };
 
-use crate::config::{Backend, Config, HealthCheck, HealthKind, LbMode};
+use crate::config::{Backend, BackendTarget, Config, HealthCheck, HealthKind, LbMode};
 
 /// Upper bound on the number of candidate backends examined per selection.
 ///
@@ -508,8 +508,17 @@ fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
 }
 
 /// Convert a config backend into a Pingora pool backend.
+///
+/// An [`BackendTarget::Instance`] entry has no address to probe/select yet, so
+/// it is skipped here: its pool is owned by the instance router (C3). Until
+/// then an instance-only site yields an empty pool (`select` returns `None`).
 fn pool_backend(backend: &Backend) -> Option<PoolBackend> {
-    PoolBackend::new_with_weight(&backend.addr.to_string(), backend.weight as usize).ok()
+    match &backend.target {
+        BackendTarget::Addr(addr) => {
+            PoolBackend::new_with_weight(&addr.to_string(), backend.weight as usize).ok()
+        }
+        BackendTarget::Instance { .. } => None,
+    }
 }
 
 /// A ketama select key built inline from a client address.
@@ -550,7 +559,17 @@ mod tests {
 
     fn backend(port: u16, weight: u32) -> Backend {
         Backend {
-            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            target: BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], port))),
+            weight,
+        }
+    }
+
+    fn instance_backend(instance: &str, port: u16, weight: u32) -> Backend {
+        Backend {
+            target: BackendTarget::Instance {
+                instance: instance.to_owned(),
+                port,
+            },
             weight,
         }
     }
@@ -581,6 +600,7 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
+            openstack_env: None,
             backends,
             lb_mode: LbMode::RoundRobin,
             health_check,
@@ -591,6 +611,7 @@ mod tests {
         Config {
             forward,
             openstack: Vec::<OpenStackSite>::new(),
+            openstack_envs: HashMap::new(),
         }
     }
 
@@ -625,7 +646,28 @@ mod tests {
         let enabled = enabled_backends(&backends);
         assert_eq!(enabled.len(), 2);
         assert!(enabled.iter().all(|b| b.weight > 0));
-        assert!(!enabled.iter().any(|b| b.addr == addr(2)));
+        assert!(!enabled
+            .iter()
+            .any(|b| b.target == BackendTarget::Addr(addr(2))));
+    }
+
+    #[test]
+    fn mixed_addr_and_instance_site_yields_an_addr_only_pool() {
+        // VERIFY-2: an instance entry is skipped, leaving only the addr peer.
+        let backends = [backend(1, 1), instance_backend("INS001", 8080, 1)];
+        let lb = engine(&backends, &LbMode::RoundRobin);
+        for _ in 0..6 {
+            assert_eq!(lb.select(None), Some(addr(1)));
+        }
+    }
+
+    #[test]
+    fn instance_only_site_yields_an_empty_pool_that_selects_none() {
+        // VERIFY-2: with no addr entry the transition pool is empty (C3 adds
+        // the InstancePool), so selection fails hard rather than panicking.
+        let backends = [instance_backend("INS001", 8080, 1)];
+        let lb = engine(&backends, &LbMode::RoundRobin);
+        assert_eq!(lb.select(None), None);
     }
 
     #[test]
@@ -786,6 +828,19 @@ mod tests {
 
         // Removing the site (or its health check) drops its probe (FIX #8).
         probes.sync(&config(vec![forward_site("gated", vec![backend(2, 1)], None)]));
+        assert_eq!(probes.slot_count(), 0);
+    }
+
+    #[test]
+    fn probe_registry_sync_skips_instance_backends() {
+        // A health-checked site whose only enabled backend is an instance has
+        // no addressable target yet, so it contributes no probe slot.
+        let probes = ProbeRegistry::new();
+        probes.sync(&config(vec![forward_site(
+            "instanced",
+            vec![instance_backend("INS001", 8080, 1)],
+            Some(tcp_health()),
+        )]));
         assert_eq!(probes.slot_count(), 0);
     }
 

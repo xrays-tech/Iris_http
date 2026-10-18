@@ -109,3 +109,34 @@ C1→C2→C3 串行（C2/C3 都依赖 C1 类型；C2/C3 均触碰 state/reload/p
 - 生产代码无 unwrap/expect/panic；无 `{config:?}` 泄露 secret（Debug redacted 回归）。
 - 文件范围不越界（唯一写者）；不改 `02-contracts.md`（除非发现契约缺陷→回报管理器）。
 - 每 lane 独立 commit 并附验证输出。
+
+## C1 配置 — 阶段记录
+
+状态：**完成**（commit `P14-C1: ...`）。
+
+实现要点（与上方 TDD 清单一致，无契约偏离）：
+
+- `Config` 新增 `openstack_envs: HashMap<String, Arc<OpenStackEnv>>`（键=env 文件 stem）；手写 `Debug` 仅渲染 `openstack_envs.len()`，secret 永不入日志。
+- `load_openstack_envs(envs_dir, env)`（`src/config/openstack.rs`，经 `mod.rs` 再导出）：目录缺失→`Ok(空)`；任一文件坏→整份失败；文件 schema = 旧 `openstack:` 块字段；`${ENV}` 展开 + `MissingEnv`；含重复环境名防御性守卫（目录布局下不可达）。
+- `OpenStackSite` 删除内嵌 `openstack: OpenStackConfig`，改为必填 `openstack_env: String`（旧内嵌格式→Parse 错）；全局校验要求引用的 env 必须存在于 `openstack_envs`，否则 `Validate`。
+- `Backend{ target: BackendTarget, weight: u32 }`；`enum BackendTarget { Addr(SocketAddr), Instance{ instance, port } }`；`addr`/`instance` 恰其一（`deny_unknown_fields`）、instance 缺 port / 空 instance / addr 带 port → 错；weight 0..=65535。
+- `ForwardSite.openstack_env: Option<String>`：有 instance 后端而无 env→`Validate`；有 env 无 instance 后端→允许。
+- `load_config(sites_dir, envs_dir, env)` 三参；`main.rs` 传 `&config_dir.join("openstack")` 并把 `envs_dir` 透传进 `ReloadService`（仅存储，目录语义留待 C3）。
+- `config_fingerprint` 重写：`{config:?}`（openstack_envs 已屏蔽）+ **按 env 名排序**，逐个哈希该 env 的 redacted `OpenStackConfig` Debug 与 password/secret 原始值。
+- `apply_new_config` resolver-reuse 段机械适配：旧/新 env 的 `OpenStackConfig` 相等则复用（仍按站点名键，env 键切换属 C3）。
+- `src/openstack/mod.rs::build_resolvers` 函数体机械适配为对 `config.openstack_envs.get(&site.openstack_env)` 的 `filter_map`（签名与站点名键不变）。
+- `src/lb.rs`：仅 `pool_backend` 一处生产改动——`BackendTarget::Instance` 机械跳过（`None`），`BackendTarget::Addr` 入池；未触碰 Pingora 自有 `Backend.addr`（约 157 行）与 `pool_set`/`enabled_backends`。
+- cfg(test) 迁移：`src/{state,proxy,routing,tls,reload,main}.rs`；`tests/config_load.rs` 全面重写（temp 配置根补空 `openstack/` 目录、19 处内联 openstack YAML 迁移、新增 env/BackendTarget/指纹测试）。
+- fixtures：新增 `tests/fixtures/openstack/prod.yaml`、`tests/fixtures/sites/003-forward-instance-example.yaml`、`tests/fixtures/e2e-p7/openstack/prod.yaml`；`sites/002-openstack-example.yaml` 与 `e2e-p7/sites/001-openstack.yaml` 迁为 `openstack_env: prod`；e2e `04`/`08`/`10` heredoc 同步迁移。
+
+验证输出：
+
+- `cargo build`：0 warning / 0 error。
+- `cargo build --tests`：0 warning / 0 error（无越界编译错误）。
+- `cargo test`：**317 passed / 0 failed**（6 suites）：lib 217、bin 7、`config_load` 71、`firewall` 11、`openstack` 11。
+- VERIFY-2（lb 跳过只存在于 `pool_backend`）：单测 `mixed_addr_and_instance_site_yields_an_addr_only_pool`（选出 addr）、`instance_only_site_yields_an_empty_pool_that_selects_none`（`select`→`None`）、`probe_registry_sync_skips_instance_backends` 均绿。
+- VERIFY-3（指纹确定性）：`fingerprint_is_independent_of_env_insertion_order`、`non_credential_env_change_changes_the_fingerprint`、`credential_rotation_changes_the_fingerprint_but_not_debug` 均绿。
+- e2e：`03-forward`、`04-tls`、`07-openstack`、`08-reload`、`09-health-reload`、`10-tls-reload`、`11-health-reload-new-site` 全部 PASS（其中 03/07/09/11 未编辑，迁移后仍绿）。
+- 生产代码无 unwrap/expect/panic/unreachable/todo/unimplemented；无签名偏离。
+
+发现（供 C3）：C1 过渡期抢答 `BackendTarget::Instance` 站点池为空 → `select` 为 `None`，由 proxy 层映射 502；Instance 池/健康/解析复用留给 C3。

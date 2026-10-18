@@ -52,7 +52,18 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Throwaway config
 # ---------------------------------------------------------------------------
-mkdir -p "$CONFIG_DIR/sites"
+mkdir -p "$CONFIG_DIR/sites" "$CONFIG_DIR/openstack"
+
+cat > "$CONFIG_DIR/openstack/prod.yaml" <<EOF
+timeout_secs: 5
+cache_ttl_secs: 86400
+auth:
+  api_url: https://controller.example.com:5000/v3
+  approach: application_credential
+  application_credential_id: e2e-id
+  application_credential_secret: e2e-secret
+nova: {}
+EOF
 
 cat > "$CONFIG_DIR/sites/001-forward-https.yaml" <<EOF
 name: www-example
@@ -84,15 +95,7 @@ http: true
 https: true
 cert_file: $CERTS/rent.do.top.crt
 key_file: $CERTS/rent.do.top.key
-openstack:
-  timeout_secs: 5
-  cache_ttl_secs: 86400
-  auth:
-    api_url: https://controller.example.com:5000/v3
-    approach: application_credential
-    application_credential_id: e2e-id
-    application_credential_secret: e2e-secret
-  nova: {}
+openstack_env: prod
 EOF
 
 echo "[stub] starting upstream on $UP1"

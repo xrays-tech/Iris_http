@@ -617,12 +617,7 @@ impl ProxyHttp for IrisProxy {
 mod tests {
     use super::*;
 
-    use url::Url;
-
-    use crate::config::{
-        AuthConfig, AuthCredentials, Backend, Config, ForwardSite, LbMode, NovaConfig,
-        OpenStackConfig, OpenStackSite,
-    };
+    use crate::config::{Backend, BackendTarget, Config, ForwardSite, LbMode, OpenStackSite};
 
     fn forward_site(name: &str, domain: &str, ports: &[(u16, u32)]) -> ForwardSite {
         ForwardSite {
@@ -632,10 +627,11 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
+            openstack_env: None,
             backends: ports
                 .iter()
                 .map(|(port, weight)| Backend {
-                    addr: SocketAddr::from(([127, 0, 0, 1], *port)),
+                    target: BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], *port))),
                     weight: *weight,
                 })
                 .collect(),
@@ -653,27 +649,16 @@ mod tests {
             cert_file: None,
             key_file: None,
             firewall_dir: None,
-            openstack: OpenStackConfig {
-                cache_ttl_secs: 86_400,
-                timeout_secs: 5,
-                auth: AuthConfig {
-                    api_url: Url::parse("https://controller.example.com:5000/v3")
-                        .expect("valid test URL"),
-                    credentials: AuthCredentials::ApplicationCredential {
-                        id: "test-id".to_owned(),
-                        secret: "test-secret".to_owned(),
-                    },
-                },
-                nova: NovaConfig {
-                    api_url: None,
-                    all_tenants: true,
-                },
-            },
+            openstack_env: "prod".to_owned(),
         }
     }
 
     fn state(forward: Vec<ForwardSite>, openstack: Vec<OpenStackSite>) -> SharedState {
-        let config = Config { forward, openstack };
+        let config = Config {
+            forward,
+            openstack,
+            openstack_envs: std::collections::HashMap::new(),
+        };
         SharedState::try_new(config).expect("shared state builds")
     }
 

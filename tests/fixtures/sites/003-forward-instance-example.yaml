@@ -1,0 +1,20 @@
+name: apps-example
+mode: forward
+domain: apps.example.com
+http: true
+https: false
+
+# Instance name or `8-4-4-4-12` UUID; the explicit port is required.
+openstack_env: prod
+backends:
+  - instance: INS001
+    port: 8080
+    weight: 2
+  - addr: 10.0.0.6:8080
+    weight: 1
+
+load_balancer: weighted_round_robin
+health_check:
+  kind: tcp
+  interval_secs: 5
+  timeout_secs: 2

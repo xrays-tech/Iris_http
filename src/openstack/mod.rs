@@ -430,10 +430,11 @@ pub fn build_resolvers(config: &Config) -> HashMap<String, Arc<dyn Resolver>> {
     config
         .openstack
         .iter()
-        .map(|site| {
+        .filter_map(|site| {
+            let env = config.openstack_envs.get(&site.openstack_env)?;
             let resolver: Arc<dyn Resolver> =
-                Arc::new(OpenStackResolver::new(&site.openstack, Arc::clone(&client)));
-            (site.name.clone(), resolver)
+                Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client)));
+            Some((site.name.clone(), resolver))
         })
         .collect()
 }

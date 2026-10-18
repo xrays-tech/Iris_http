@@ -137,7 +137,10 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let env: HashMap<String, String> = std::env::vars().collect();
-    let config = load_config(&sites_dir, &env)
+    // Standalone OpenStack environments live under `<config-dir>/openstack/`
+    // (one `<name>.yaml` per environment; the file stem is the env name).
+    let envs_dir = args.config_dir.join("openstack");
+    let config = load_config(&sites_dir, &envs_dir, &env)
         .map_err(|err| anyhow::anyhow!("failed to load configuration: {err}"))?;
 
     // Compile the routing table, per-site load balancers, firewall tables,
@@ -217,6 +220,7 @@ fn run(args: RunArgs) -> anyhow::Result<()> {
         ReloadService::new(
             Arc::clone(&shared),
             sites_dir.clone(),
+            envs_dir.clone(),
             env,
             args.watch_config,
         ),
@@ -355,6 +359,7 @@ mod probe_tests {
         let config = Config {
             forward: Vec::new(),
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         Arc::new(SharedState::try_new(config).expect("empty shared state builds"))
     }

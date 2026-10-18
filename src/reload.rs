@@ -86,9 +86,12 @@ impl std::error::Error for ReloadError {}
 ///
 /// The fingerprint is a hex-encoded 64-bit hash of the configuration's
 /// canonical rendering **including credential material** (FIX #4): the
-/// redacting `Debug` rendering covers every non-secret field, and each
-/// credential's real secret is hashed separately so a credential-only rotation
-/// changes the fingerprint (and is therefore applied by `--watch-config`). Only
+/// redacting `Debug` rendering covers every non-secret field (with
+/// `openstack_envs` masked to a count so the `HashMap` iteration order cannot
+/// perturb it), and each environment is then hashed explicitly in **sorted
+/// env-name order** — its redacted [`OpenStackConfig`] `Debug` plus its
+/// password/secret raw values — so both a non-credential change (api_url,
+/// cache_ttl, ...) and a credential-only rotation change the fingerprint. Only
 /// the hash is exposed (by `/version`), never the secrets.
 pub fn config_fingerprint(config: &Config) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -97,15 +100,24 @@ pub fn config_fingerprint(config: &Config) -> String {
     use crate::config::AuthCredentials;
 
     let mut hasher = DefaultHasher::new();
-    // `Debug` is deterministic for a fixed field order and renders every
-    // non-secret field (secrets are redacted, so they are added explicitly next).
+    // `Config`'s Debug masks `openstack_envs` (only its length is rendered), so
+    // this is deterministic for a fixed field order and renders every
+    // non-secret field; the per-environment secrets are added explicitly below.
     format!("{config:?}").hash(&mut hasher);
-    // The redacted secret fields, hashed in load order.
-    for site in &config.openstack {
-        site.name.hash(&mut hasher);
-        match &site.openstack.auth.credentials {
-            AuthCredentials::Password { password, .. } => password.hash(&mut hasher),
-            AuthCredentials::ApplicationCredential { secret, .. } => secret.hash(&mut hasher),
+
+    // Hash each environment in sorted name order: the redacted config Debug
+    // covers api_url/nova/timeout/cache_ttl, and the raw credential value is
+    // hashed separately (the Debug redacts it).
+    let mut names: Vec<&String> = config.openstack_envs.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(env) = config.openstack_envs.get(name) {
+            env.name.hash(&mut hasher);
+            format!("{:?}", env.config()).hash(&mut hasher);
+            match &env.config().auth.credentials {
+                AuthCredentials::Password { password, .. } => password.hash(&mut hasher),
+                AuthCredentials::ApplicationCredential { secret, .. } => secret.hash(&mut hasher),
+            }
         }
     }
     format!("{:016x}", hasher.finish())
@@ -174,23 +186,32 @@ pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadEr
     }
 
     // Resolvers: reuse the live resolver for an openstack site whose
-    // control-plane configuration is byte-for-byte unchanged.
+    // environment's control-plane configuration is byte-for-byte unchanged.
     let client = Arc::new(HttpClient::new());
     let mut resolvers: HashMap<String, Arc<dyn Resolver>> =
         HashMap::with_capacity(cfg.openstack.len());
     for site in &cfg.openstack {
-        let unchanged = old
-            .config
-            .openstack
-            .iter()
-            .any(|old_site| old_site.name == site.name && old_site.openstack == site.openstack);
+        // The environment reference is validated at load time; a hand-built
+        // `Config` without the environment simply has no resolver for the site.
+        let Some(env) = cfg.openstack_envs.get(&site.openstack_env) else {
+            continue;
+        };
+        let unchanged = old.config.openstack.iter().any(|old_site| {
+            old_site.name == site.name
+                && old
+                    .config
+                    .openstack_envs
+                    .get(&old_site.openstack_env)
+                    .map(|old_env| old_env.config())
+                    == Some(env.config())
+        });
         let resolver: Arc<dyn Resolver> = if unchanged {
             match old.resolvers.get(&site.name) {
                 Some(existing) => Arc::clone(existing),
-                None => Arc::new(OpenStackResolver::new(&site.openstack, Arc::clone(&client))),
+                None => Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client))),
             }
         } else {
-            Arc::new(OpenStackResolver::new(&site.openstack, Arc::clone(&client)))
+            Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client)))
         };
         resolvers.insert(site.name.clone(), resolver);
     }
@@ -297,6 +318,7 @@ pub fn record_firewall_denied(reason: &str) {
 pub struct ReloadService {
     state: Arc<SharedState>,
     sites_dir: PathBuf,
+    envs_dir: PathBuf,
     env: HashMap<String, String>,
     watch_config: bool,
 }
@@ -306,12 +328,14 @@ impl ReloadService {
     pub fn new(
         state: Arc<SharedState>,
         sites_dir: PathBuf,
+        envs_dir: PathBuf,
         env: HashMap<String, String>,
         watch_config: bool,
     ) -> Self {
         Self {
             state,
             sites_dir,
+            envs_dir,
             env,
             watch_config,
         }
@@ -326,7 +350,7 @@ impl ReloadService {
     /// `config_reload_total{ok="false"}`, and leaves the old configuration
     /// serving.
     pub fn reload_once(&self, force: bool) -> bool {
-        let cfg = match load_config(&self.sites_dir, &self.env) {
+        let cfg = match load_config(&self.sites_dir, &self.envs_dir, &self.env) {
             Ok(cfg) => cfg,
             Err(err) => {
                 record_config_reload(false);
@@ -381,6 +405,7 @@ impl BackgroundService for ReloadService {
 
         tracing::info!(
             sites_dir = %self.sites_dir.display(),
+            envs_dir = %self.envs_dir.display(),
             watch_config = self.watch_config,
             "reload service started (SIGHUP triggers a hot reload)"
         );
@@ -459,9 +484,37 @@ mod tests {
     use url::Url;
 
     use crate::config::{
-        AuthConfig, AuthCredentials, Backend, ForwardSite, HealthCheck, HealthKind, LbMode,
-        NovaConfig, OpenStackConfig, OpenStackSite,
+        AuthConfig, AuthCredentials, Backend, BackendTarget, ForwardSite, HealthCheck, HealthKind,
+        LbMode, NovaConfig, OpenStackConfig, OpenStackEnv, OpenStackSite,
     };
+
+    fn env_config(cache_ttl_secs: u64) -> OpenStackConfig {
+        OpenStackConfig {
+            cache_ttl_secs,
+            timeout_secs: 5,
+            auth: AuthConfig {
+                api_url: Url::parse("http://127.0.0.1:9/v3").expect("valid test URL"),
+                credentials: AuthCredentials::ApplicationCredential {
+                    id: "id".to_owned(),
+                    secret: "secret".to_owned(),
+                },
+            },
+            nova: NovaConfig {
+                api_url: None,
+                all_tenants: true,
+            },
+        }
+    }
+
+    fn openstack_envs(cache_ttl_secs: u64) -> HashMap<String, Arc<OpenStackEnv>> {
+        HashMap::from([(
+            "prod".to_owned(),
+            Arc::new(OpenStackEnv {
+                name: "prod".to_owned(),
+                config: env_config(cache_ttl_secs),
+            }),
+        )])
+    }
 
     fn forward_site(name: &str, domain: &str, port: u16) -> ForwardSite {
         ForwardSite {
@@ -471,8 +524,9 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
+            openstack_env: None,
             backends: vec![Backend {
-                addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                target: BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], port))),
                 weight: 1,
             }],
             lb_mode: LbMode::RoundRobin,
@@ -480,7 +534,7 @@ mod tests {
         }
     }
 
-    fn openstack_site(name: &str, base_domain: &str, cache_ttl_secs: u64) -> OpenStackSite {
+    fn openstack_site(name: &str, base_domain: &str) -> OpenStackSite {
         OpenStackSite {
             name: name.to_owned(),
             base_domain: base_domain.to_owned(),
@@ -489,28 +543,15 @@ mod tests {
             cert_file: None,
             key_file: None,
             firewall_dir: None,
-            openstack: OpenStackConfig {
-                cache_ttl_secs,
-                timeout_secs: 5,
-                auth: AuthConfig {
-                    api_url: Url::parse("http://127.0.0.1:9/v3").expect("valid test URL"),
-                    credentials: AuthCredentials::ApplicationCredential {
-                        id: "id".to_owned(),
-                        secret: "secret".to_owned(),
-                    },
-                },
-                nova: NovaConfig {
-                    api_url: None,
-                    all_tenants: true,
-                },
-            },
+            openstack_env: "prod".to_owned(),
         }
     }
 
     fn config_a() -> Config {
         Config {
             forward: vec![forward_site("www", "www.example.com", 18081)],
-            openstack: vec![openstack_site("rent", "rent.do.top", 86_400)],
+            openstack: vec![openstack_site("rent", "rent.do.top")],
+            openstack_envs: openstack_envs(86_400),
         }
     }
 
@@ -520,7 +561,8 @@ mod tests {
                 forward_site("www", "www.example.com", 18082),
                 forward_site("api", "api.example.com", 18083),
             ],
-            openstack: vec![openstack_site("rent", "rent.do.top", 43_200)],
+            openstack: vec![openstack_site("rent", "rent.do.top")],
+            openstack_envs: openstack_envs(43_200),
         }
     }
 
@@ -541,15 +583,73 @@ mod tests {
 
         // A single field change is enough.
         let mut tweaked = config_a();
-        tweaked.forward[0].backends[0].addr = SocketAddr::from(([127, 0, 0, 1], 19999));
+        tweaked.forward[0].backends[0].target =
+            BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 19999)));
         assert_ne!(one, config_fingerprint(&tweaked));
+    }
+
+    #[test]
+    fn fingerprint_is_independent_of_env_insertion_order() {
+        // Two environments inserted in opposite orders must fingerprint equally
+        // (the HashMap iteration order must not leak into the hash).
+        let mut a = HashMap::new();
+        let mut b = HashMap::new();
+        let prod = || {
+            Arc::new(OpenStackEnv {
+                name: "prod".to_owned(),
+                config: env_config(86_400),
+            })
+        };
+        let dev = || {
+            Arc::new(OpenStackEnv {
+                name: "dev".to_owned(),
+                config: env_config(3_600),
+            })
+        };
+        a.insert("prod".to_owned(), prod());
+        a.insert("dev".to_owned(), dev());
+        b.insert("dev".to_owned(), dev());
+        b.insert("prod".to_owned(), prod());
+
+        let ca = Config {
+            forward: Vec::new(),
+            openstack: Vec::new(),
+            openstack_envs: a,
+        };
+        let cb = Config {
+            forward: Vec::new(),
+            openstack: Vec::new(),
+            openstack_envs: b,
+        };
+        assert_eq!(config_fingerprint(&ca), config_fingerprint(&cb));
+    }
+
+    #[test]
+    fn non_credential_env_change_changes_the_fingerprint() {
+        let a = config_a();
+        let base = config_fingerprint(&a);
+
+        let mut changed = config_a();
+        Arc::make_mut(changed.openstack_envs.get_mut("prod").expect("prod env"))
+            .config
+            .cache_ttl_secs = 43_200;
+
+        assert_ne!(
+            base,
+            config_fingerprint(&changed),
+            "changing cache_ttl_secs must change the fingerprint"
+        );
     }
 
     #[test]
     fn credential_rotation_changes_the_fingerprint_but_not_debug() {
         let a = config_a();
         let mut b = config_a();
-        match &mut b.openstack[0].openstack.auth.credentials {
+        match &mut Arc::make_mut(b.openstack_envs.get_mut("prod").expect("prod env"))
+            .config
+            .auth
+            .credentials
+        {
             AuthCredentials::ApplicationCredential { secret, .. } => {
                 *secret = "rotated-secret".to_owned();
             }
@@ -631,8 +731,9 @@ mod tests {
             https: true,
             cert_file: Some("/no/such/cert.pem".into()),
             key_file: Some("/no/such/key.pem".into()),
+            openstack_env: None,
             backends: vec![Backend {
-                addr: SocketAddr::from(([127, 0, 0, 1], 18084)),
+                target: BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 18084))),
                 weight: 1,
             }],
             lb_mode: LbMode::RoundRobin,
@@ -695,9 +796,11 @@ mod tests {
         let state = own_state(config_a());
         let existing = state.resolver_for("rent").expect("resolver present");
 
-        // Changes cache_ttl_secs -> the openstack config differs.
+        // Changes cache_ttl_secs of the environment -> the config differs.
         let mut changed = config_a();
-        changed.openstack[0].openstack.cache_ttl_secs = 43_200;
+        Arc::make_mut(changed.openstack_envs.get_mut("prod").expect("prod env"))
+            .config
+            .cache_ttl_secs = 43_200;
         apply_new_config(&state, changed).expect("apply");
 
         let after = state.resolver_for("rent").expect("resolver present");
@@ -714,10 +817,13 @@ mod tests {
         let state = own_state(config_a());
         let before = state.lb("www").expect("www lb");
 
-        // Only the openstack site changes; www's pool / algorithm / health spec
-        // are equal, so its engine (and attached health probe) must be kept.
+        // Only the openstack environment changes; www's pool / algorithm /
+        // health spec are equal, so its engine (and attached health probe) must
+        // be kept.
         let mut next = config_a();
-        next.openstack[0].openstack.cache_ttl_secs = 43_200;
+        Arc::make_mut(next.openstack_envs.get_mut("prod").expect("prod env"))
+            .config
+            .cache_ttl_secs = 43_200;
         apply_new_config(&state, next).expect("apply");
 
         let after = state.lb("www").expect("www lb");
@@ -733,7 +839,8 @@ mod tests {
         let before = state.lb("www").expect("www lb");
 
         let mut changed = config_a();
-        changed.forward[0].backends[0].addr = SocketAddr::from(([127, 0, 0, 1], 18099));
+        changed.forward[0].backends[0].target =
+            BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 18099)));
         apply_new_config(&state, changed).expect("apply");
 
         let after = state.lb("www").expect("www lb");
@@ -851,11 +958,15 @@ mod tests {
         std::fs::write(dir.join("001-forward.yaml"), body).expect("write site");
     }
 
-    fn service_for(sites_dir: &Path) -> ReloadService {
+    /// Build a service over `<config_root>/sites` + `<config_root>/openstack`.
+    fn service_for(config_root: &Path) -> ReloadService {
+        let sites = config_root.join("sites");
+        let envs = config_root.join("openstack");
+        std::fs::create_dir_all(&envs).expect("mkdir envs");
         let env = HashMap::new();
-        let cfg = load_config(sites_dir, &env).expect("initial config loads");
+        let cfg = load_config(&sites, &envs, &env).expect("initial config loads");
         let state = Arc::new(own_state(cfg));
-        ReloadService::new(state, sites_dir.to_path_buf(), env, false)
+        ReloadService::new(state, sites, envs, env, false)
     }
 
     #[test]
@@ -865,7 +976,7 @@ mod tests {
         std::fs::create_dir(&sites).expect("mkdir");
         write_forward_site(&sites, 18081);
 
-        let service = service_for(&sites);
+        let service = service_for(dir.path());
         let before = service.state.fingerprint();
 
         write_forward_site(&sites, 18082);
@@ -884,7 +995,7 @@ mod tests {
         std::fs::create_dir(&sites).expect("mkdir");
         write_forward_site(&sites, 18081);
 
-        let service = service_for(&sites);
+        let service = service_for(dir.path());
         let before = service.state.fingerprint();
 
         std::fs::write(sites.join("002-bad.yaml"), ": : not yaml\n").expect("write bad");
@@ -907,7 +1018,7 @@ mod tests {
         std::fs::create_dir(&sites).expect("mkdir");
         write_forward_site(&sites, 18081);
 
-        let service = service_for(&sites);
+        let service = service_for(dir.path());
         assert!(
             !service.reload_once(false),
             "an unchanged config is a no-op for a watch re-scan"
@@ -921,7 +1032,7 @@ mod tests {
         std::fs::create_dir(&sites).expect("mkdir");
         write_forward_site(&sites, 18081);
 
-        let service = service_for(&sites);
+        let service = service_for(dir.path());
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move {
             service.start(rx).await;

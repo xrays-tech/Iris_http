@@ -258,12 +258,8 @@ fn parse_port(port_str: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AuthConfig, AuthCredentials, ForwardSite, LbMode, NovaConfig, OpenStackConfig,
-        OpenStackSite,
-    };
+    use crate::config::{ForwardSite, LbMode, OpenStackSite};
     use std::collections::HashMap;
-    use url::Url;
 
     // ----- fixtures -----
 
@@ -275,6 +271,7 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
+            openstack_env: None,
             backends: Vec::new(),
             lb_mode: LbMode::RoundRobin,
             health_check: None,
@@ -290,22 +287,7 @@ mod tests {
             cert_file: None,
             key_file: None,
             firewall_dir: None,
-            openstack: OpenStackConfig {
-                cache_ttl_secs: 86_400,
-                timeout_secs: 5,
-                auth: AuthConfig {
-                    api_url: Url::parse("https://controller.example.com:5000/v3")
-                        .expect("valid test URL"),
-                    credentials: AuthCredentials::ApplicationCredential {
-                        id: "test-id".to_owned(),
-                        secret: "test-secret".to_owned(),
-                    },
-                },
-                nova: NovaConfig {
-                    api_url: None,
-                    all_tenants: true,
-                },
-            },
+            openstack_env: "prod".to_owned(),
         }
     }
 
@@ -313,6 +295,7 @@ mod tests {
         let cfg = Config {
             forward: forward_domains.iter().map(|d| forward(d)).collect(),
             openstack: base_domains.iter().map(|b| openstack(b)).collect(),
+            openstack_envs: HashMap::new(),
         };
         RoutingTable::try_from(&cfg).expect("routing table builds")
     }
@@ -537,6 +520,7 @@ mod tests {
         let cfg = Config {
             forward: vec![forward("a.example.com"), forward("a.example.com")],
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         let t = RoutingTable::try_from(&cfg).expect("builds");
         assert_eq!(t.lookup("a.example.com"), Some(RouteTarget::Forward(0)));
@@ -547,6 +531,7 @@ mod tests {
         let cfg = Config {
             forward: Vec::new(),
             openstack: vec![openstack("rent.do.top"), openstack("rent.do.top")],
+            openstack_envs: HashMap::new(),
         };
         let t = RoutingTable::try_from(&cfg).expect("builds");
         assert_eq!(t.lookup("ins-80.rent.do.top"), Some(os(0, "ins", 80)));

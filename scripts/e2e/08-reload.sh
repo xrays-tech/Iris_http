@@ -41,6 +41,7 @@ BASE="rent.do.top"
 WORK="target/e2e-p8"
 CFG_DIR="$WORK/config"
 SITES_DIR="$CFG_DIR/sites"
+ENVS_DIR="$CFG_DIR/openstack"
 FW_DIR="$WORK/firewall"
 SERVERS_DIR="$WORK/servers"
 LOG_DIR="$WORK/logs"
@@ -48,7 +49,7 @@ PIDFILE="$WORK/iris.pid"
 RECORD="$WORK/os-record.jsonl"
 
 rm -rf "$WORK"
-mkdir -p "$SITES_DIR" "$FW_DIR" "$SERVERS_DIR" "$LOG_DIR"
+mkdir -p "$SITES_DIR" "$ENVS_DIR" "$FW_DIR" "$SERVERS_DIR" "$LOG_DIR"
 
 echo "[build] cargo build --bin iris"
 cargo build --bin iris --quiet
@@ -83,6 +84,16 @@ YAML
 }
 
 write_openstack_site() { # $1=cache_ttl_secs
+  cat > "$ENVS_DIR/prod.yaml" <<YAML
+timeout_secs: 5
+cache_ttl_secs: $1
+auth:
+  api_url: http://127.0.0.1:$OS_PORT/v3
+  approach: application_credential
+  application_credential_id: e2e-id
+  application_credential_secret: e2e-secret
+nova: {}
+YAML
   cat > "$SITES_DIR/002-openstack.yaml" <<YAML
 name: rent
 mode: openstack
@@ -90,15 +101,7 @@ base_domain: $BASE
 http: true
 https: false
 firewall_dir: $FW_DIR
-openstack:
-  timeout_secs: 5
-  cache_ttl_secs: $1
-  auth:
-    api_url: http://127.0.0.1:$OS_PORT/v3
-    approach: application_credential
-    application_credential_id: e2e-id
-    application_credential_secret: e2e-secret
-  nova: {}
+openstack_env: prod
 YAML
 }
 

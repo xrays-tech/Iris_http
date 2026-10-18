@@ -10,12 +10,5 @@ key_file: tests/fixtures/certs/rent.do.top.key
 # uniform 403 (firewall.md §4). The role files live next to this fixture.
 firewall_dir: tests/fixtures/e2e-p7/firewall
 
-openstack:
-  timeout_secs: 5
-  cache_ttl_secs: 86400
-  auth:
-    api_url: http://127.0.0.1:18102/v3
-    approach: application_credential
-    application_credential_id: e2e-id
-    application_credential_secret: e2e-secret
-  nova: {}
+# Control-plane settings live in `tests/fixtures/e2e-p7/openstack/prod.yaml`.
+openstack_env: prod

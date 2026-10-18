@@ -249,9 +249,34 @@ mod tests {
     use url::Url;
 
     use crate::config::{
-        AuthConfig, AuthCredentials, Backend, Config, ForwardSite, LbMode, NovaConfig,
-        OpenStackConfig, OpenStackSite,
+        AuthConfig, AuthCredentials, Backend, BackendTarget, Config, ForwardSite, LbMode,
+        NovaConfig, OpenStackConfig, OpenStackEnv, OpenStackSite,
     };
+
+    fn envs() -> HashMap<String, Arc<OpenStackEnv>> {
+        HashMap::from([(
+            "prod".to_owned(),
+            Arc::new(OpenStackEnv {
+                name: "prod".to_owned(),
+                config: OpenStackConfig {
+                    cache_ttl_secs: 86_400,
+                    timeout_secs: 5,
+                    auth: AuthConfig {
+                        api_url: Url::parse("https://controller.example.com:5000/v3")
+                            .expect("valid test URL"),
+                        credentials: AuthCredentials::ApplicationCredential {
+                            id: "test-id".to_owned(),
+                            secret: "test-secret".to_owned(),
+                        },
+                    },
+                    nova: NovaConfig {
+                        api_url: None,
+                        all_tenants: true,
+                    },
+                },
+            }),
+        )])
+    }
 
     fn forward_site(name: &str, domain: &str, mode: LbMode) -> ForwardSite {
         ForwardSite {
@@ -261,8 +286,9 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
+            openstack_env: None,
             backends: vec![Backend {
-                addr: SocketAddr::from(([127, 0, 0, 1], 18081)),
+                target: BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 18081))),
                 weight: 1,
             }],
             lb_mode: mode,
@@ -279,22 +305,7 @@ mod tests {
             cert_file: None,
             key_file: None,
             firewall_dir: firewall_dir.map(Path::to_path_buf),
-            openstack: OpenStackConfig {
-                cache_ttl_secs: 86_400,
-                timeout_secs: 5,
-                auth: AuthConfig {
-                    api_url: Url::parse("https://controller.example.com:5000/v3")
-                        .expect("valid test URL"),
-                    credentials: AuthCredentials::ApplicationCredential {
-                        id: "test-id".to_owned(),
-                        secret: "test-secret".to_owned(),
-                    },
-                },
-                nova: NovaConfig {
-                    api_url: None,
-                    all_tenants: true,
-                },
-            },
+            openstack_env: "prod".to_owned(),
         }
     }
 
@@ -302,6 +313,7 @@ mod tests {
         let config = Config {
             forward: sites,
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         SharedState::try_new(config).expect("shared state builds")
     }
@@ -369,6 +381,7 @@ mod tests {
         let config = Config {
             forward: vec![site],
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         let err = match SharedState::try_new(config) {
             Ok(_) => panic!("a missing certificate must fail the build"),
@@ -384,6 +397,7 @@ mod tests {
         let config = Config {
             forward: Vec::new(),
             openstack: vec![openstack_site("rent", "rent.do.top", None)],
+            openstack_envs: envs(),
         };
         let state = SharedState::try_new(config).expect("state builds");
         assert!(
@@ -403,6 +417,7 @@ mod tests {
         let config = Config {
             forward: Vec::new(),
             openstack: vec![openstack_site("rent", "rent.do.top", Some(dir.path()))],
+            openstack_envs: envs(),
         };
         let state = SharedState::try_new(config).expect("state builds");
         let table = state.firewall_for("rent").expect("firewall table present");
@@ -420,6 +435,7 @@ mod tests {
         let config = Config {
             forward: Vec::new(),
             openstack: vec![openstack_site("rent", "rent.do.top", Some(dir.path()))],
+            openstack_envs: envs(),
         };
         let err = match SharedState::try_new(config) {
             Ok(_) => panic!("bad role file must fail the build"),
@@ -435,6 +451,7 @@ mod tests {
         let config = || Config {
             forward: vec![forward_site("www", "www.example.com", LbMode::RoundRobin)],
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         let a = SharedState::try_new(config()).expect("state builds");
         let b = SharedState::try_new(config()).expect("state builds");
@@ -447,11 +464,13 @@ mod tests {
         let a = SharedState::try_new(Config {
             forward: vec![forward_site("www", "www.example.com", LbMode::RoundRobin)],
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         })
         .expect("state builds");
         let b = SharedState::try_new(Config {
             forward: vec![forward_site("www", "www.example.com", LbMode::Ketama)],
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         })
         .expect("state builds");
         assert_ne!(a.fingerprint().as_str(), b.fingerprint().as_str());
@@ -462,9 +481,9 @@ mod tests {
     #[test]
     fn forward_engines_share_the_snapshot_registry() {
         let mut a = forward_site("a", "a.example.com", LbMode::RoundRobin);
-        a.backends[0].addr = SocketAddr::from(([127, 0, 0, 1], 18091));
+        a.backends[0].target = BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 18091)));
         let mut b = forward_site("b", "b.example.com", LbMode::Random);
-        b.backends[0].addr = SocketAddr::from(([127, 0, 0, 1], 18092));
+        b.backends[0].target = BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 18092)));
         let state = state_with(vec![a, b]);
 
         // Both engines' views contribute to the one snapshot registry.

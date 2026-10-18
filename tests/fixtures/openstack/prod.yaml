@@ -1,0 +1,13 @@
+timeout_secs: 5
+cache_ttl_secs: 86400
+auth:
+  api_url: https://controller.example.com:5000/v3
+  approach: password
+  username: proxy
+  password: ${OS_PASSWORD}
+  project_name: admin
+  project_domain_name: Default
+  user_domain_name: Default
+nova:
+  api_url: https://controller.example.com:8774/v2.1
+  all_tenants: true

@@ -1,0 +1,8 @@
+timeout_secs: 5
+cache_ttl_secs: 86400
+auth:
+  api_url: http://127.0.0.1:18102/v3
+  approach: application_credential
+  application_credential_id: e2e-id
+  application_credential_secret: e2e-secret
+nova: {}

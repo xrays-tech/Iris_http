@@ -282,15 +282,11 @@ impl TlsAccept for SniCertSource {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
-    use url::Url;
-
-    use crate::config::{
-        AuthConfig, AuthCredentials, Backend, ForwardSite, LbMode, NovaConfig, OpenStackConfig,
-        OpenStackSite,
-    };
+    use crate::config::{Backend, BackendTarget, ForwardSite, LbMode, OpenStackSite};
 
     const WWW_CERT: &str = "tests/fixtures/certs/www.example.com.crt";
     const WWW_KEY: &str = "tests/fixtures/certs/www.example.com.key";
@@ -305,8 +301,9 @@ mod tests {
             https,
             cert_file: https.then(|| PathBuf::from(WWW_CERT)),
             key_file: https.then(|| PathBuf::from(WWW_KEY)),
+            openstack_env: None,
             backends: vec![Backend {
-                addr: SocketAddr::from(([127, 0, 0, 1], 18081)),
+                target: BackendTarget::Addr(SocketAddr::from(([127, 0, 0, 1], 18081))),
                 weight: 1,
             }],
             lb_mode: LbMode::RoundRobin,
@@ -323,28 +320,17 @@ mod tests {
             cert_file: https.then(|| PathBuf::from(RENT_CERT)),
             key_file: https.then(|| PathBuf::from(RENT_KEY)),
             firewall_dir: None,
-            openstack: OpenStackConfig {
-                cache_ttl_secs: 86_400,
-                timeout_secs: 5,
-                auth: AuthConfig {
-                    api_url: Url::parse("https://controller.example.com:5000/v3")
-                        .expect("valid test URL"),
-                    credentials: AuthCredentials::ApplicationCredential {
-                        id: "test-id".to_owned(),
-                        secret: "test-secret".to_owned(),
-                    },
-                },
-                nova: NovaConfig {
-                    api_url: None,
-                    all_tenants: true,
-                },
-            },
+            openstack_env: "prod".to_owned(),
         }
     }
 
     /// A map built directly from a config with no parsing (fixtures only).
     fn map(forward: Vec<ForwardSite>, openstack: Vec<OpenStackSite>) -> SniCertMap {
-        let config = Config { forward, openstack };
+        let config = Config {
+            forward,
+            openstack,
+            openstack_envs: HashMap::new(),
+        };
         SniCertMap::from_sites(&config).expect("certificate map builds")
     }
 
@@ -445,6 +431,7 @@ mod tests {
         let config = Config {
             forward: Vec::new(),
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         let m = SniCertMap::from_sites(&config).expect("empty config builds");
         assert!(m.exact.is_empty());
@@ -458,6 +445,7 @@ mod tests {
         let config = Config {
             forward: vec![site],
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         let err = SniCertMap::from_sites(&config).expect_err("missing cert must error");
         assert!(format!("{err:#}").contains("/no/such/cert.crt"));
@@ -477,6 +465,7 @@ mod tests {
         let config = Config {
             forward: vec![site],
             openstack: Vec::new(),
+            openstack_envs: HashMap::new(),
         };
         let err = SniCertMap::from_sites(&config).expect_err("garbage cert must error");
         assert!(format!("{err:#}").contains("bad.crt"));

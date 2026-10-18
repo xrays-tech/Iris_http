@@ -26,6 +26,12 @@ pub struct ForwardSite {
     pub cert_file: Option<PathBuf>,
     /// PEM private-key path (required when `https`).
     pub key_file: Option<PathBuf>,
+    /// OpenStack environment referenced by this site's instance backends.
+    ///
+    /// Required when any backend is [`BackendTarget::Instance`]; must name an
+    /// entry of [`crate::config::Config::openstack_envs`]. `None` is valid only
+    /// for an all-`addr` backend set.
+    pub openstack_env: Option<String>,
     /// Upstream backends (at least one; `weight == 0` disables an entry).
     pub backends: Vec<Backend>,
     /// Load-balancing algorithm.
@@ -37,10 +43,28 @@ pub struct ForwardSite {
 /// A single forward backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Backend {
-    /// Upstream `IP:port` literal (no hostnames / DNS at load).
-    pub addr: SocketAddr,
+    /// Where the backend lives: a literal address or a discoverable instance.
+    pub target: BackendTarget,
     /// Relative weight; `0` disables the backend (P3 excludes it).
     pub weight: u32,
+}
+
+/// The target of a forward backend: exactly one of an address or an instance.
+///
+/// `addr` and `instance` are mutually exclusive at the YAML entry level
+/// (`config.md` §3); an instance target carries its explicit `port` and is
+/// resolved through the site's referenced OpenStack environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendTarget {
+    /// Upstream `IP:port` literal (no hostnames / DNS at load).
+    Addr(SocketAddr),
+    /// An OpenStack instance (name or `8-4-4-4-12` UUID) plus its target port.
+    Instance {
+        /// Instance name or UUID.
+        instance: String,
+        /// Target port on the instance.
+        port: u16,
+    },
 }
 
 /// Load-balancing algorithm (`config.md` §5).
@@ -105,6 +129,8 @@ pub(crate) struct RawForward {
     pub(crate) cert_file: Option<String>,
     #[serde(default)]
     pub(crate) key_file: Option<String>,
+    #[serde(default)]
+    pub(crate) openstack_env: Option<String>,
     pub(crate) backends: Vec<RawBackend>,
     #[serde(default)]
     pub(crate) load_balancer: Option<String>,
@@ -112,11 +138,16 @@ pub(crate) struct RawForward {
     pub(crate) health_check: Option<RawHealthCheck>,
 }
 
-/// Raw backend entry.
+/// Raw backend entry: exactly one of `addr` or `instance`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RawBackend {
-    pub(crate) addr: String,
+    #[serde(default)]
+    pub(crate) addr: Option<String>,
+    #[serde(default)]
+    pub(crate) instance: Option<String>,
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
     #[serde(default = "super::default_weight")]
     pub(crate) weight: u32,
 }
@@ -202,16 +233,69 @@ pub(crate) fn parse(
         ));
     }
     let mut backends = Vec::with_capacity(raw.backends.len());
+    let mut has_instance = false;
     for raw_backend in raw.backends {
-        let addr: SocketAddr = raw_backend.addr.parse().map_err(|_| {
-            site_error(
-                file,
-                format!(
-                    "site '{}': invalid backend addr '{}' (expected an IP:port literal)",
-                    raw.name, raw_backend.addr
-                ),
-            )
-        })?;
+        let target = match (raw_backend.addr, raw_backend.instance) {
+            (Some(_), Some(_)) => {
+                return Err(site_error(
+                    file,
+                    format!(
+                        "site '{}': backend must set exactly one of addr or instance, not both",
+                        raw.name
+                    ),
+                ));
+            }
+            (None, None) => {
+                return Err(site_error(
+                    file,
+                    format!(
+                        "site '{}': backend must set either addr or instance",
+                        raw.name
+                    ),
+                ));
+            }
+            (Some(addr), None) => {
+                if raw_backend.port.is_some() {
+                    return Err(site_error(
+                        file,
+                        format!(
+                            "site '{}': an addr backend must not set the port field (use addr: IP:port)",
+                            raw.name
+                        ),
+                    ));
+                }
+                let addr: SocketAddr = addr.parse().map_err(|_| {
+                    site_error(
+                        file,
+                        format!(
+                            "site '{}': invalid backend addr '{}' (expected an IP:port literal)",
+                            raw.name, addr
+                        ),
+                    )
+                })?;
+                BackendTarget::Addr(addr)
+            }
+            (None, Some(instance)) => {
+                let instance = instance.trim().to_owned();
+                if instance.is_empty() {
+                    return Err(site_error(
+                        file,
+                        format!("site '{}': backend instance must not be empty", raw.name),
+                    ));
+                }
+                let port = raw_backend.port.ok_or_else(|| {
+                    site_error(
+                        file,
+                        format!(
+                            "site '{}': an instance backend requires the port field",
+                            raw.name
+                        ),
+                    )
+                })?;
+                has_instance = true;
+                BackendTarget::Instance { instance, port }
+            }
+        };
         if raw_backend.weight > 65_535 {
             return Err(site_error(
                 file,
@@ -222,9 +306,32 @@ pub(crate) fn parse(
             ));
         }
         backends.push(Backend {
-            addr,
+            target,
             weight: raw_backend.weight,
         });
+    }
+
+    let openstack_env = match raw.openstack_env {
+        None => None,
+        Some(name) => {
+            let name = name.trim().to_owned();
+            if name.is_empty() {
+                return Err(site_error(
+                    file,
+                    format!("site '{}': openstack_env must not be empty", raw.name),
+                ));
+            }
+            Some(name)
+        }
+    };
+    if has_instance && openstack_env.is_none() {
+        return Err(site_error(
+            file,
+            format!(
+                "site '{}': an instance backend requires openstack_env",
+                raw.name
+            ),
+        ));
     }
 
     let lb_mode = match raw.load_balancer.as_deref() {
@@ -249,6 +356,7 @@ pub(crate) fn parse(
         https: raw.https,
         cert_file,
         key_file,
+        openstack_env,
         backends,
         lb_mode,
         health_check,

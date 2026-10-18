@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use url::Url;
@@ -38,13 +39,15 @@ pub struct OpenStackSite {
     pub key_file: Option<PathBuf>,
     /// Optional firewall rule directory (enforced when set).
     pub firewall_dir: Option<PathBuf>,
-    /// OpenStack control-plane settings.
-    pub openstack: OpenStackConfig,
+    /// Name of the referenced [`OpenStackEnv`] (file stem under
+    /// `<config-dir>/openstack/`); required.
+    pub openstack_env: String,
 }
 
 impl fmt::Debug for OpenStackSite {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // `openstack` uses `OpenStackConfig`'s (redacted) Debug.
+        // Only the environment *name* is rendered; its (redacted) config lives
+        // in `Config::openstack_envs`.
         f.debug_struct("OpenStackSite")
             .field("name", &self.name)
             .field("base_domain", &self.base_domain)
@@ -53,7 +56,37 @@ impl fmt::Debug for OpenStackSite {
             .field("cert_file", &self.cert_file)
             .field("key_file", &self.key_file)
             .field("firewall_dir", &self.firewall_dir)
-            .field("openstack", &self.openstack)
+            .field("openstack_env", &self.openstack_env)
+            .finish()
+    }
+}
+
+/// A standalone OpenStack environment loaded from
+/// `<config-dir>/openstack/<name>.yaml`.
+///
+/// The file stem is the environment name; sites (openstack wildcard sites and
+/// forward sites with instance backends) reference it by name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpenStackEnv {
+    /// Environment name (the file stem).
+    pub name: String,
+    /// The control-plane configuration from the environment file.
+    pub config: OpenStackConfig,
+}
+
+impl OpenStackEnv {
+    /// The control-plane configuration (secrets redacted only in `Debug`).
+    pub fn config(&self) -> &OpenStackConfig {
+        &self.config
+    }
+}
+
+impl fmt::Debug for OpenStackEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Delegates to `OpenStackConfig`'s redacting Debug (via `AuthConfig`).
+        f.debug_struct("OpenStackEnv")
+            .field("name", &self.name)
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -170,7 +203,7 @@ pub(crate) struct RawOpenStackSite {
     pub(crate) key_file: Option<String>,
     #[serde(default)]
     pub(crate) firewall_dir: Option<String>,
-    pub(crate) openstack: RawOpenStackConfig,
+    pub(crate) openstack_env: String,
 }
 
 /// Raw OpenStack control-plane block.
@@ -301,40 +334,13 @@ pub(crate) fn parse(
         }
     };
 
-    let os = raw.openstack;
-    if !(MIN_CACHE_TTL_SECS..=MAX_CACHE_TTL_SECS).contains(&os.cache_ttl_secs) {
+    let openstack_env = raw.openstack_env.trim().to_owned();
+    if openstack_env.is_empty() {
         return Err(site_error(
             file,
-            format!(
-                "site '{}': cache_ttl_secs {} out of range {}..={}",
-                raw.name, os.cache_ttl_secs, MIN_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS
-            ),
+            format!("site '{}': openstack_env is required", raw.name),
         ));
     }
-    if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&os.timeout_secs) {
-        return Err(site_error(
-            file,
-            format!(
-                "site '{}': timeout_secs {} out of range {}..={}",
-                raw.name, os.timeout_secs, MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS
-            ),
-        ));
-    }
-
-    let auth = parse_auth(os.auth, &raw.name, file, env)?;
-
-    let api_url = match os.nova.api_url {
-        None => None,
-        Some(value) => Some(Url::parse(&value).map_err(|err| {
-            site_error(
-                file,
-                format!(
-                    "site '{}': invalid nova.api_url '{}': {err}",
-                    raw.name, value
-                ),
-            )
-        })?),
-    };
 
     Ok(OpenStackSite {
         name: raw.name,
@@ -344,16 +350,134 @@ pub(crate) fn parse(
         cert_file,
         key_file,
         firewall_dir,
-        openstack: OpenStackConfig {
-            cache_ttl_secs: os.cache_ttl_secs,
-            timeout_secs: os.timeout_secs,
-            auth,
-            nova: NovaConfig {
-                api_url,
-                all_tenants: os.nova.all_tenants,
-            },
+        openstack_env,
+    })
+}
+
+/// Validate and normalise a raw environment file's control-plane block.
+///
+/// `name` names the environment (the file stem) for error messages; `file` is
+/// the environment file itself.
+pub(crate) fn build_openstack_config(
+    os: RawOpenStackConfig,
+    name: &str,
+    file: &Path,
+    env: &HashMap<String, String>,
+) -> Result<OpenStackConfig, ConfigError> {
+    if !(MIN_CACHE_TTL_SECS..=MAX_CACHE_TTL_SECS).contains(&os.cache_ttl_secs) {
+        return Err(site_error(
+            file,
+            format!(
+                "openstack env '{name}': cache_ttl_secs {} out of range {}..={}",
+                os.cache_ttl_secs, MIN_CACHE_TTL_SECS, MAX_CACHE_TTL_SECS
+            ),
+        ));
+    }
+    if !(MIN_TIMEOUT_SECS..=MAX_TIMEOUT_SECS).contains(&os.timeout_secs) {
+        return Err(site_error(
+            file,
+            format!(
+                "openstack env '{name}': timeout_secs {} out of range {}..={}",
+                os.timeout_secs, MIN_TIMEOUT_SECS, MAX_TIMEOUT_SECS
+            ),
+        ));
+    }
+
+    let auth = parse_auth(os.auth, name, file, env)?;
+
+    let api_url = match os.nova.api_url {
+        None => None,
+        Some(value) => Some(Url::parse(&value).map_err(|err| {
+            site_error(
+                file,
+                format!("openstack env '{name}': invalid nova.api_url '{value}': {err}"),
+            )
+        })?),
+    };
+
+    Ok(OpenStackConfig {
+        cache_ttl_secs: os.cache_ttl_secs,
+        timeout_secs: os.timeout_secs,
+        auth,
+        nova: NovaConfig {
+            api_url,
+            all_tenants: os.nova.all_tenants,
         },
     })
+}
+
+/// Load every `*.yaml` environment file under `envs_dir`, keyed by file stem.
+///
+/// A missing (or non-directory) `envs_dir` is `Ok(empty)`: no environment is
+/// configured and any site that references one fails validation. Any single
+/// unreadable/unparseable/invalid file fails the whole load, mirroring the
+/// site-file semantics.
+pub fn load_openstack_envs(
+    envs_dir: &Path,
+    env: &HashMap<String, String>,
+) -> Result<HashMap<String, Arc<OpenStackEnv>>, ConfigError> {
+    let mut envs: HashMap<String, Arc<OpenStackEnv>> = HashMap::new();
+    if !envs_dir.is_dir() {
+        return Ok(envs);
+    }
+
+    let entries = std::fs::read_dir(envs_dir).map_err(|err| {
+        ConfigError::Io(std::io::Error::new(
+            err.kind(),
+            format!(
+                "failed to read openstack env directory '{}': {err}",
+                envs_dir.display()
+            ),
+        ))
+    })?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            ConfigError::Io(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "failed to read an entry of '{}': {err}",
+                    envs_dir.display()
+                ),
+            ))
+        })?;
+        let path = entry.path();
+        if path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("yaml") {
+            files.push(path);
+        }
+    }
+    files.sort();
+
+    for path in &files {
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| ConfigError::Parse {
+                file: path.clone(),
+                msg: "openstack env file name is not valid UTF-8".to_owned(),
+            })?
+            .to_owned();
+        if envs.contains_key(&name) {
+            return Err(ConfigError::Validate(format!(
+                "duplicate openstack env name '{name}' (file '{}')",
+                path.display()
+            )));
+        }
+
+        let text = std::fs::read_to_string(path).map_err(|err| ConfigError::Parse {
+            file: path.clone(),
+            msg: format!("failed to read file: {err}"),
+        })?;
+        let raw: RawOpenStackConfig =
+            serde_yaml::from_str(&text).map_err(|err| ConfigError::Parse {
+                file: path.clone(),
+                msg: err.to_string(),
+            })?;
+        let config = build_openstack_config(raw, &name, path, env)?;
+        envs.insert(name.clone(), Arc::new(OpenStackEnv { name, config }));
+    }
+
+    Ok(envs)
 }
 
 fn parse_auth(
@@ -474,59 +598,51 @@ fn expand_path(
 mod tests {
     use super::*;
 
-    /// A minimal, otherwise-valid raw openstack site with the given timeout.
-    fn raw(timeout_secs: u64) -> RawOpenStackSite {
-        RawOpenStackSite {
-            name: "rent".to_owned(),
-            mode: "openstack".to_owned(),
-            base_domain: "rent.do.top".to_owned(),
-            http: true,
-            https: false,
-            cert_file: None,
-            key_file: None,
-            firewall_dir: None,
-            openstack: RawOpenStackConfig {
-                cache_ttl_secs: 86_400,
-                timeout_secs,
-                auth: RawAuth {
-                    api_url: Some("https://controller.example.com:5000/v3".to_owned()),
-                    approach: "application_credential".to_owned(),
-                    username: None,
-                    password: None,
-                    project_name: None,
-                    project_domain_name: None,
-                    user_domain_name: None,
-                    application_credential_id: Some("id".to_owned()),
-                    application_credential_secret: Some("secret".to_owned()),
-                },
-                nova: RawNova {
-                    api_url: None,
-                    all_tenants: true,
-                },
+    /// A minimal, otherwise-valid raw environment block with the given timeout.
+    fn raw(timeout_secs: u64) -> RawOpenStackConfig {
+        RawOpenStackConfig {
+            cache_ttl_secs: 86_400,
+            timeout_secs,
+            auth: RawAuth {
+                api_url: Some("https://controller.example.com:5000/v3".to_owned()),
+                approach: "application_credential".to_owned(),
+                username: None,
+                password: None,
+                project_name: None,
+                project_domain_name: None,
+                user_domain_name: None,
+                application_credential_id: Some("id".to_owned()),
+                application_credential_secret: Some("secret".to_owned()),
+            },
+            nova: RawNova {
+                api_url: None,
+                all_tenants: true,
             },
         }
     }
 
     #[test]
     fn timeout_secs_out_of_range_is_rejected() {
-        let file = Path::new("sites/001-openstack.yaml");
+        let file = Path::new("openstack/prod.yaml");
         let env = HashMap::new();
 
         // A zero timeout fails every Nova request instantly; reject it.
-        let err = parse(raw(0), file, &env).expect_err("timeout_secs = 0 must be rejected");
+        let err =
+            build_openstack_config(raw(0), "prod", file, &env).expect_err("timeout 0 must be rejected");
         assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
 
-        let err = parse(raw(601), file, &env).expect_err("timeout_secs = 601 must be rejected");
+        let err = build_openstack_config(raw(601), "prod", file, &env)
+            .expect_err("timeout 601 must be rejected");
         assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
     }
 
     #[test]
     fn timeout_secs_accepts_the_inclusive_bounds() {
-        let file = Path::new("sites/001-openstack.yaml");
+        let file = Path::new("openstack/prod.yaml");
         let env = HashMap::new();
 
-        assert!(parse(raw(MIN_TIMEOUT_SECS), file, &env).is_ok());
-        assert!(parse(raw(MAX_TIMEOUT_SECS), file, &env).is_ok());
+        assert!(build_openstack_config(raw(MIN_TIMEOUT_SECS), "prod", file, &env).is_ok());
+        assert!(build_openstack_config(raw(MAX_TIMEOUT_SECS), "prod", file, &env).is_ok());
     }
 }
 
