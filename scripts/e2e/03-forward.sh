@@ -173,4 +173,13 @@ if [ "$code" != "404" ]; then
 fi
 
 echo
+echo "=== cleartext + http:false (no-http.test) — expect 404 (P16) ==="
+code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: no-http.test' "http://127.0.0.1:$PROXY_PORT/" || true)"
+echo "    HTTP $code"
+if [ "$code" != "404" ]; then
+  echo "ASSERT FAIL: an http:false site must not be served on the cleartext listener (got $code)"
+  exit 1
+fi
+
+echo
 echo "ALL P3 FORWARD E2E ASSERTIONS PASSED"

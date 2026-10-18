@@ -37,8 +37,8 @@ pub struct OpenStackSite {
     pub cert_file: Option<PathBuf>,
     /// PEM private-key path (required when `https`).
     pub key_file: Option<PathBuf>,
-    /// Optional firewall rule directory (enforced when set).
-    pub firewall_dir: Option<PathBuf>,
+    /// Firewall rule directory (required; ACLs are always enforced).
+    pub firewall_dir: PathBuf,
     /// Name of the referenced [`OpenStackEnv`] (file stem under
     /// `<config-dir>/openstack/`); required.
     pub openstack_env: String,
@@ -317,8 +317,17 @@ pub(crate) fn parse(
         }
     }
 
+    // `firewall_dir` is required (P16): without it an openstack wildcard site
+    // would be an unauthenticated arbitrary-port proxy into any visible
+    // instance. Missing field or a missing/non-directory path is a
+    // `ConfigError::Validate`, so reload keeps the previous configuration.
     let firewall_dir = match expand_path(&raw.firewall_dir, env)? {
-        None => None,
+        None => {
+            return Err(site_error(
+                file,
+                format!("site '{}': firewall_dir is required", raw.name),
+            ));
+        }
         Some(dir) => {
             if !dir.is_dir() {
                 return Err(site_error(
@@ -330,7 +339,7 @@ pub(crate) fn parse(
                     ),
                 ));
             }
-            Some(dir)
+            dir
         }
     };
 

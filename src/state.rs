@@ -61,8 +61,8 @@ pub struct Snapshot {
     /// Per-openstack-site firewall tables, keyed by
     /// [`crate::config::OpenStackSite::name`] (P7).
     ///
-    /// A site **without** `firewall_dir` has no entry here, which means "no ACL
-    /// checks" for that site (`firewall.md` §4).
+    /// Every openstack site carries a required `firewall_dir` (P16), so every
+    /// site always has an entry: ACLs are always enforced (`firewall.md` §4).
     pub firewall: Arc<HashMap<String, Arc<FirewallTable>>>,
     /// Per-openstack-**environment** instance resolvers, keyed by environment
     /// name (`Config::openstack_envs` key, C3).
@@ -147,9 +147,9 @@ impl SharedState {
     /// Build the shared state from a loaded [`Config`].
     ///
     /// Constructs the routing table, one load balancer per forward site (all
-    /// sharing one [`HealthRegistry`]), the per-SNI certificate table and, per
-    /// openstack site, either a firewall table or a `WARN` log when the site has
-    /// no `firewall_dir` (`firewall.md` §4), plus one instance resolver.
+    /// sharing one [`HealthRegistry`]), the per-SNI certificate table, one
+    /// firewall table per openstack site (its `firewall_dir` is required, P16;
+    /// `firewall.md` §4) plus one instance resolver.
     ///
     /// A bad `.role` file (`firewall.md` §2) or a missing/unparseable
     /// certificate fails the whole build with context (startup is fail-fast).
@@ -171,24 +171,14 @@ impl SharedState {
         registry.set_health_check(Box::new(crate::lb::SharedProbe(Arc::clone(&probes))));
         probes.sync(&config);
 
-        // Build one firewall table per openstack site that configures a
-        // `firewall_dir`; a malformed `.role` file fails the whole build. A
-        // site without `firewall_dir` is skipped (no ACL checks, one WARN).
+        // Build one firewall table per openstack site; a malformed `.role` file
+        // fails the whole build. Every site has a required `firewall_dir` (P16),
+        // so there is no "ACL disabled" path.
         let mut firewall: HashMap<String, Arc<FirewallTable>> =
             HashMap::with_capacity(config.openstack.len());
         for site in &config.openstack {
-            match &site.firewall_dir {
-                Some(dir) => {
-                    let table = build_firewall(dir)?;
-                    firewall.insert(site.name.clone(), Arc::new(table));
-                }
-                None => {
-                    tracing::warn!(
-                        site = %site.name,
-                        "openstack site has no firewall_dir; ACL checks are disabled for it"
-                    );
-                }
-            }
+            let table = build_firewall(&site.firewall_dir)?;
+            firewall.insert(site.name.clone(), Arc::new(table));
         }
 
         // One shared resolver per OpenStack environment, so every consumer of
@@ -347,7 +337,7 @@ mod tests {
         }
     }
 
-    fn openstack_site(name: &str, base_domain: &str, firewall_dir: Option<&Path>) -> OpenStackSite {
+    fn openstack_site(name: &str, base_domain: &str, firewall_dir: &Path) -> OpenStackSite {
         OpenStackSite {
             name: name.to_owned(),
             base_domain: base_domain.to_owned(),
@@ -355,7 +345,7 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
-            firewall_dir: firewall_dir.map(Path::to_path_buf),
+            firewall_dir: firewall_dir.to_path_buf(),
             openstack_env: "prod".to_owned(),
         }
     }
@@ -444,18 +434,19 @@ mod tests {
     // ----- P7: firewall / resolvers wiring -----
 
     #[test]
-    fn openstack_site_without_firewall_dir_skips_acl_and_still_builds_resolver() {
+    fn openstack_site_builds_a_firewall_entry_and_a_resolver() {
+        // P16: `firewall_dir` is required, so every openstack site gets a
+        // firewall table; the WARN/"ACL disabled" path no longer exists.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("web.role"), "allowed_ports: [80]\n").expect("write role");
         let config = Config {
             forward: Vec::new(),
-            openstack: vec![openstack_site("rent", "rent.do.top", None)],
+            openstack: vec![openstack_site("rent", "rent.do.top", dir.path())],
             openstack_envs: envs(),
         };
         let state = SharedState::try_new(config).expect("state builds");
-        assert!(
-            state.snapshot().firewall.is_empty(),
-            "a site without firewall_dir must not appear in the firewall map"
-        );
-        assert!(state.firewall_for("rent").is_none());
+        assert_eq!(state.snapshot().firewall.len(), 1);
+        assert!(state.firewall_for("rent").is_some());
         // Resolvers are keyed by ENVIRONMENT name, not site name (C3).
         assert!(state.resolver_for("prod").is_some());
         assert!(state.resolver_for("rent").is_none());
@@ -464,11 +455,12 @@ mod tests {
 
     #[test]
     fn openstack_sites_sharing_an_env_share_one_resolver() {
+        let dir = tempfile::tempdir().expect("tempdir");
         let config = Config {
             forward: Vec::new(),
             openstack: vec![
-                openstack_site("rent-a", "a.do.top", None),
-                openstack_site("rent-b", "b.do.top", None),
+                openstack_site("rent-a", "a.do.top", dir.path()),
+                openstack_site("rent-b", "b.do.top", dir.path()),
             ],
             openstack_envs: envs(),
         };
@@ -522,7 +514,7 @@ mod tests {
 
         let config = Config {
             forward: Vec::new(),
-            openstack: vec![openstack_site("rent", "rent.do.top", Some(dir.path()))],
+            openstack: vec![openstack_site("rent", "rent.do.top", dir.path())],
             openstack_envs: envs(),
         };
         let state = SharedState::try_new(config).expect("state builds");
@@ -540,7 +532,7 @@ mod tests {
 
         let config = Config {
             forward: Vec::new(),
-            openstack: vec![openstack_site("rent", "rent.do.top", Some(dir.path()))],
+            openstack: vec![openstack_site("rent", "rent.do.top", dir.path())],
             openstack_envs: envs(),
         };
         let err = match SharedState::try_new(config) {

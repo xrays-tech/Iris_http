@@ -1,0 +1,10 @@
+name: http-off
+mode: forward
+domain: no-http.test
+http: false
+https: true
+cert_file: tests/fixtures/certs/www.example.com.crt
+key_file: tests/fixtures/certs/www.example.com.key
+
+backends:
+  - addr: 127.0.0.1:18081

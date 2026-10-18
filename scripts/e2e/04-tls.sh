@@ -52,7 +52,14 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Throwaway config
 # ---------------------------------------------------------------------------
-mkdir -p "$CONFIG_DIR/sites" "$CONFIG_DIR/openstack"
+mkdir -p "$CONFIG_DIR/sites" "$CONFIG_DIR/openstack" "$CONFIG_DIR/firewall"
+
+# openstack sites require a firewall_dir (P16); the wildcard site below is only
+# used for SNI certificate selection, but the role dir must still exist.
+cat > "$CONFIG_DIR/firewall/INS001.role" <<EOF
+allowed_ports:
+  - 80
+EOF
 
 cat > "$CONFIG_DIR/openstack/prod.yaml" <<EOF
 timeout_secs: 5
@@ -95,7 +102,20 @@ http: true
 https: true
 cert_file: $CERTS/rent.do.top.crt
 key_file: $CERTS/rent.do.top.key
+firewall_dir: $CONFIG_DIR/firewall
 openstack_env: prod
+EOF
+
+cat > "$CONFIG_DIR/sites/004-forward-https-only.yaml" <<EOF
+name: secure
+mode: forward
+domain: secure.example.com
+http: false
+https: true
+cert_file: $CERTS/www.example.com.crt
+key_file: $CERTS/www.example.com.key
+backends:
+  - addr: 127.0.0.1:$UP1
 EOF
 
 echo "[stub] starting upstream on $UP1"
@@ -204,6 +224,15 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: www.example.com' "http:
 echo "    HTTP $code"
 if [ "$code" != "200" ]; then
   echo "ASSERT FAIL: expected 200, got $code"
+  exit 1
+fi
+
+echo
+echo "=== cleartext + http:false (Host=secure.example.com over :$HTTP_PORT) — expect 404 (P16) ==="
+code="$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: secure.example.com' "http://127.0.0.1:$HTTP_PORT/" || true)"
+echo "    HTTP $code"
+if [ "$code" != "404" ]; then
+  echo "ASSERT FAIL: an http:false site must not be served on the cleartext listener (got $code)"
   exit 1
 fi
 

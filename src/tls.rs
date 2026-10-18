@@ -319,7 +319,7 @@ mod tests {
             https,
             cert_file: https.then(|| PathBuf::from(RENT_CERT)),
             key_file: https.then(|| PathBuf::from(RENT_KEY)),
-            firewall_dir: None,
+            firewall_dir: PathBuf::from("tests/fixtures/openstack-firewall"),
             openstack_env: "prod".to_owned(),
         }
     }

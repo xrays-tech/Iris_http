@@ -74,16 +74,19 @@ blacklist:
 - 客户端 IP 取连接对端地址（Pingora `Session::client_addr()`），端口即 `upstream_peer` 要用的目标端口。
 - **403（Forbidden）统一用于 ACL 拒绝**（对探测者隐藏"实例是否存在"的差别：未授权实例与端口未开放均 403；实例存在性差异由 `discovery.md` 的 404 语义单独表达——两条路径职责分离：先 ACL 后发现）。
 
-## 4. 无 role / 未配置 firewall_dir 的语义
+## 4. 无 role / firewall_dir 的语义
+
+`firewall_dir` 是 openstack 站点的**必填**字段（P16）：未配置，或配置的目录不存在/非目录，
+均为配置错误（`ConfigError::Validate`，reload 时保持旧配置）。不存在"跳过 ACL"的运行态。
 
 | 情况 | 行为 | 理由 |
 |---|---|---|
-| 未配置 `firewall_dir` | 不做 ACL 校验（仅解析实例→发现→代理） | `propose.md`：防火墙为"可以支持"的可选项 |
-| 配置了 `firewall_dir`，但某实例无 role 文件 | **403**（default deny） | 安全最佳实践：开放列表是显式白名单 |
-| 配置了 `firewall_dir`，role 存在但 `allowed_ports` 为空 | 任何端口均 403 | 空开放列表 = 不开放 |
+| 未配置 `firewall_dir` | **加载失败**（`ConfigError::Validate`） | 无防火墙的 openstack 通配站点 = 未认证的任意端口代理（实例名与端口均来自 Host），必须默认拒绝 |
+| `firewall_dir` 不是已存在的目录 | **加载失败**（`ConfigError::Validate`） | 同上；路径拼写错误不应静默地关闭 ACL |
+| 某实例无 role 文件 | **403**（default deny） | 安全最佳实践：开放列表是显式白名单 |
+| role 存在但 `allowed_ports` 为空 | 任何端口均 403 | 空开放列表 = 不开放 |
 
-> 生产建议：openstack 站点一律配置 `firewall_dir`；未配置仅在受信内网/测试环境使用，
-> 并应在启动日志给出 `WARN`（"站点 X 未启用防火墙"）。
+> `forward` 站点不受影响：其实例后端由 operator 在配置里钉死实例名与端口，Host 不可控，无 SSRF。
 
 ## 5. 实现
 

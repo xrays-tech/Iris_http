@@ -28,7 +28,7 @@ pub enum HealthKind { Tcp, Http }
 pub struct OpenStackSite {
     pub name: String, pub base_domain: String, pub http: bool, pub https: bool,
     pub cert_file: Option<PathBuf>, pub key_file: Option<PathBuf>,
-    pub firewall_dir: Option<PathBuf>, pub openstack_env: String,   // 必填；引用 openstack_envs
+    pub firewall_dir: PathBuf, pub openstack_env: String,           // firewall_dir 必填（P16）；openstack_env 必填，引用 openstack_envs
 }
 pub struct OpenStackEnv { pub name: String, pub config: OpenStackConfig }
 impl OpenStackEnv { pub fn config(&self) -> &OpenStackConfig; }     // Debug 经 OpenStackConfig（redacted）
@@ -159,7 +159,7 @@ pub struct Snapshot {
     pub routing: Arc<RoutingTable>,
     pub lbs: Arc<HashMap<String, Arc<ForwardBackends>>>,     // 键=forward 站点 name
     pub certs: Arc<SniCertMap>,
-    pub firewall: Arc<HashMap<String, Arc<FirewallTable>>>,  // 键=openstack 站点 name；无 firewall_dir 的站点不出现（=不校验，仅 WARN）
+    pub firewall: Arc<HashMap<String, Arc<FirewallTable>>>,  // 键=openstack 站点 name；每站点必有（firewall_dir 必填，P16）
     pub resolvers: Arc<HashMap<String, Arc<dyn Resolver>>>,  // 键=openstack 环境名（一环境一共享 resolver/缓存；openstack 站点与 forward instance 后端共用）
     pub registry: Arc<HealthRegistry>,                       // 跨 reload 共享，不是每次替换
     pub fingerprint: Arc<String>,

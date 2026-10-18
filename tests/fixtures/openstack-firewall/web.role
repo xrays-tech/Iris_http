@@ -1,0 +1,4 @@
+# Fixture firewall directory for unit tests (P16): every openstack site must
+# configure a `firewall_dir`. `web` is the instance used by proxy/reload tests.
+allowed_ports:
+  - 80

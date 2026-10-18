@@ -92,13 +92,13 @@ TLS 证书在进程内维护（`SniCertSource` 读共享快照），**执行 `ir
 规则提醒：
 
 - forward HTTPS 站点证书按**精确域名**匹配；openstack HTTPS 站点的 SNI 是任意 `{instance}-{port}.base_domain`，必须提供**通配证书 `*.base_domain`**（示例生成脚本 `scripts/gen-test-certs.sh`）。
-- SNI 无任何站点证书 → 中断握手（TLS 层无 HTTP 状态码）；TLS 建立后 Host 命中 `http: false` 站点 → HTTP 421。
+- SNI 无任何站点证书 → 中断握手（TLS 层无 HTTP 状态码）；TLS 建立后 Host 命中 `https: false` 站点，或命中站点与 SNI 选中的证书不属于同一站点 → HTTP **421**。明文（80）Host 命中 `http: false` 站点 → HTTP **404**（拒绝明文降级；两个监听器对称：421 对应 443 侧，404 对应 80 侧）。
 
 ## 5. 配置变更 / 防火墙
 
 - 站点增删改：改 `/etc/iris/sites/*.yaml` 后 `systemctl reload iris`。forward 后端池变更走 `lb.update()` 原子换表；openstack 解析器缓存保留（控制面配置未变时）。
 - 健康检查：reload 新增/变更的 forward 站点立即挂入共享探针（503/宕机后端不被选中）。
-- 防火墙：在 openstack 站点 `firewall_dir` 下放 `INSTANCE.role`（`allowed_ports`/`whitelist`/`blacklist`，CIDR 或纯 IP），reload 即生效；单文件解析失败整份拒绝并保持旧规则。
+- 防火墙：openstack 站点的 `firewall_dir` **必填**；未配置或目录不存在 → 加载/reload 校验失败（保持旧配置）。在该目录下放 `INSTANCE.role`（`allowed_ports`/`whitelist`/`blacklist`，CIDR 或纯 IP），reload 即生效；单文件解析失败整份拒绝并保持旧规则。
 - 敏感项：凭据建议走 `${ENV}`（`${OS_PASSWORD}` 等），`Environment=` 注入；`Debug`/日志/`/version` 永不落 secret。
 
 ## 6. 排障

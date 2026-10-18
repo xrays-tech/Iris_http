@@ -89,23 +89,37 @@ pub struct IrisProxy {
     pub shared: Arc<SharedState>,
 }
 
-/// The `(https, site_name)` pair for a matched route, or `None` when the host
+/// The listener flags and name of a matched route, or `None` when the host
 /// matched no site. Reads the request's snapshot (FIX #3).
 ///
-/// The name is borrowed from the snapshot's config — the caller (a TLS-path
-/// check) never needs an owned copy (OPT-2: no per-request `site.name` clone).
-pub fn site_facts<'a>(snapshot: &'a Snapshot, decision: &RouteDecision) -> Option<(bool, &'a str)> {
+/// The name is borrowed from the snapshot's config — the caller (a pre-forward
+/// guard) never needs an owned copy (OPT-2: no per-request `site.name` clone).
+pub struct SiteFacts<'a> {
+    /// Whether the site serves the plain-HTTP listener.
+    pub http: bool,
+    /// Whether the site serves the TLS listener.
+    pub https: bool,
+    /// The site name (borrowed from the snapshot's config).
+    pub name: &'a str,
+}
+
+/// The [`SiteFacts`] for a matched route (`plan/16-review-fixes.md`).
+pub fn site_facts<'a>(snapshot: &'a Snapshot, decision: &RouteDecision) -> Option<SiteFacts<'a>> {
     match decision {
-        RouteDecision::Forward { site_idx, .. } => snapshot
-            .config
-            .forward
-            .get(*site_idx)
-            .map(|site| (site.https, site.name.as_str())),
-        RouteDecision::OpenStack { site_idx, .. } => snapshot
-            .config
-            .openstack
-            .get(*site_idx)
-            .map(|site| (site.https, site.name.as_str())),
+        RouteDecision::Forward { site_idx, .. } => {
+            snapshot.config.forward.get(*site_idx).map(|site| SiteFacts {
+                http: site.http,
+                https: site.https,
+                name: site.name.as_str(),
+            })
+        }
+        RouteDecision::OpenStack { site_idx, .. } => {
+            snapshot.config.openstack.get(*site_idx).map(|site| SiteFacts {
+                http: site.http,
+                https: site.https,
+                name: site.name.as_str(),
+            })
+        }
         RouteDecision::NotFound => None,
     }
 }
@@ -327,16 +341,48 @@ pub fn should_421(site_https: bool, same_site_as_sni: bool) -> bool {
     !site_https || !same_site_as_sni
 }
 
+/// Whether a request that arrived on a listener may be served by a site with
+/// the given plain-HTTP flag (`plan/16-review-fixes.md` FIX #1).
+///
+/// A TLS-arrived request (`is_tls == true`) is never gated by the HTTP flag —
+/// the 443 side is owned by the [`should_421`] misdirection guard. On the
+/// plain-HTTP listener a site only serves the request when it declares
+/// `http: true`, so an HTTPS-only site can never be downgraded to cleartext.
+pub fn should_serve_http(site_http: bool, is_tls: bool) -> bool {
+    is_tls || site_http
+}
+
+/// The pre-forward guard verdict for a matched route: `Some(status)` when the
+/// request must be answered before forwarding, `None` to continue.
+///
+/// * TLS + an `https:false` site, or a site whose certificate the SNI did not
+///   select → `421 Misdirected Request`.
+/// * plain HTTP + an `http:false` site → `404` (mirror of the 421 guard: the
+///   site is unreachable on the cleartext listener).
+pub fn preforward_status(
+    is_tls: bool,
+    same_site_as_sni: bool,
+    facts: &SiteFacts<'_>,
+) -> Option<u16> {
+    if is_tls {
+        should_421(facts.https, same_site_as_sni).then_some(421)
+    } else if should_serve_http(facts.http, false) {
+        None
+    } else {
+        Some(404)
+    }
+}
+
 /// Map a per-site firewall evaluation to an outbound HTTP status (P7).
 ///
-/// * `site_has_firewall == false` → `None`: the site configured no
-///   `firewall_dir`, so no ACL checks run (`firewall.md` §4).
+/// * `site_has_firewall == false` → `None`: no ACL checks run. Since P16 every
+///   openstack site has a required `firewall_dir`, so production always passes
+///   `true`; the parameter is retained for the pure-function tests.
 /// * the site has a firewall and the ACL allows → `None` (proceed).
 /// * the ACL denies → `Some(403)`: the uniform, detail-free rejection
 ///   (`firewall.md` §3/§6).
-/// * the site configures a firewall but no table was loaded → `Some(403)`
-///   (fail closed; this is an internal inconsistency — a site with a
-///   `firewall_dir` always has a table after a successful build).
+/// * the site has a firewall but no table was loaded → `Some(403)` (fail
+///   closed; an internal inconsistency — a successful build always has one).
 pub fn firewall_verdict_to_http(
     firewall: Option<&FirewallTable>,
     instance: &str,
@@ -465,7 +511,9 @@ pub async fn openstack_gate(
         return OpenStackOutcome::Deny(404);
     };
     let site_name = site.name.clone();
-    let has_firewall = site.firewall_dir.is_some();
+    // Every openstack site carries a required `firewall_dir` (P16), so the ACL
+    // always applies; `firewall_verdict_to_http` receives `true`.
+    let has_firewall = true;
 
     // Firewall ACL first: a denial must not reach discovery (`firewall.md` §1).
     let table = snapshot.firewall.get(&site_name).map(|table| table.as_ref());
@@ -587,27 +635,32 @@ impl ProxyHttp for IrisProxy {
         let snapshot = self.shared.snapshot();
         let host = request_host(session);
         let decision = decide_route(&snapshot, &host);
+        let sni = tls_sni(session);
+        let facts = site_facts(&snapshot, &decision);
 
-        // Misdirected-request guard (P4): only a TLS connection can be
-        // misdirected. A site that does not serve HTTPS, or one whose
-        // certificate the SNI did not select, must be answered with 421.
-        if let Some(sni) = tls_sni(session) {
-            if let Some((site_https, site_name)) = site_facts(&snapshot, &decision) {
-                let same_site_as_sni = snapshot
-                    .certs
-                    .lookup(&sni)
-                    .map(|cert| cert.site() == site_name)
-                    .unwrap_or(false);
-                if should_421(site_https, same_site_as_sni) {
-                    tracing::debug!(
-                        sni = %sni,
-                        host = %host,
-                        site = %site_name,
-                        "misdirected request over TLS; answering 421"
-                    );
-                    session.respond_error(421).await?;
-                    return Ok(true);
-                }
+        // Pre-forward listener guard (P4 + P16). A TLS connection cannot be
+        // misdirected and a cleartext request cannot be served by an
+        // HTTPS-only site; both are answered before any forwarding.
+        if let Some(facts) = &facts {
+            let same_site_as_sni = sni
+                .as_ref()
+                .map(|sni| {
+                    snapshot
+                        .certs
+                        .lookup(sni)
+                        .map(|cert| cert.site() == facts.name)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if let Some(status) = preforward_status(sni.is_some(), same_site_as_sni, facts) {
+                tracing::debug!(
+                    host = %host,
+                    site = %facts.name,
+                    status,
+                    "request refused by the listener guard before forwarding"
+                );
+                session.respond_error(status).await?;
+                return Ok(true);
             }
         }
 
@@ -856,6 +909,10 @@ mod tests {
         }
     }
 
+    /// A committed firewall directory whose `web.role` allows port 80, used as
+    /// the default `firewall_dir` for proxy-test openstack sites (P16).
+    const FW_DIR: &str = "tests/fixtures/openstack-firewall";
+
     fn openstack_site(name: &str, base_domain: &str) -> OpenStackSite {
         OpenStackSite {
             name: name.to_owned(),
@@ -864,7 +921,7 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
-            firewall_dir: None,
+            firewall_dir: std::path::PathBuf::from(FW_DIR),
             openstack_env: "prod".to_owned(),
         }
     }
@@ -987,6 +1044,57 @@ mod tests {
     #[test]
     fn should_421_allows_matching_https_site() {
         assert!(!should_421(true, true));
+    }
+
+    // ----- P16: plain-HTTP listener guard -----
+
+    #[test]
+    fn should_serve_http_is_table_driven() {
+        // http:false + cleartext -> deny; http:true + cleartext -> allow;
+        // a TLS request is never gated here (the 421 guard owns 443).
+        assert!(!should_serve_http(false, false), "http:false cleartext denied");
+        assert!(should_serve_http(true, false), "http:true cleartext allowed");
+        assert!(should_serve_http(false, true), "TLS passes to the 421 guard");
+        assert!(should_serve_http(true, true), "TLS passes to the 421 guard");
+    }
+
+    #[test]
+    fn request_filter_guard_denies_cleartext_http_false_site() {
+        // request_filter intent: after routing, a site with `http: false` is
+        // answered 404 on the plain-HTTP listener (mirror of the 421 guard),
+        // while the same site is served over TLS when its cert was selected.
+        let mut site = forward_site("secure", "secure.example.com", &[(18081, 1)]);
+        site.http = false;
+        site.https = true;
+        site.cert_file = Some("tests/fixtures/certs/www.example.com.crt".into());
+        site.key_file = Some("tests/fixtures/certs/www.example.com.key".into());
+        let shared = state(vec![site], vec![]);
+        let snapshot = shared.snapshot();
+
+        let decision = decide_route(&snapshot, "secure.example.com:80");
+        let facts = site_facts(&snapshot, &decision).expect("the site matches");
+        assert_eq!(
+            preforward_status(false, false, &facts),
+            Some(404),
+            "cleartext request to an http:false site must be refused"
+        );
+        assert_eq!(
+            preforward_status(true, true, &facts),
+            None,
+            "the same site is served over TLS"
+        );
+    }
+
+    #[test]
+    fn request_filter_guard_answers_421_for_https_false_site_over_tls() {
+        let facts = SiteFacts {
+            http: true,
+            https: false,
+            name: "plain",
+        };
+        assert_eq!(preforward_status(true, false, &facts), Some(421));
+        // The same http:true site is fine on the cleartext listener.
+        assert_eq!(preforward_status(false, false, &facts), None);
     }
 
     // ----- P7: firewall -> status mapping -----
@@ -1377,10 +1485,10 @@ mod tests {
     fn openstack_site_with_firewall(
         name: &str,
         base_domain: &str,
-        dir: Option<&std::path::Path>,
+        dir: &std::path::Path,
     ) -> OpenStackSite {
         let mut site = openstack_site(name, base_domain);
-        site.firewall_dir = dir.map(std::path::Path::to_path_buf);
+        site.firewall_dir = dir.to_path_buf();
         site
     }
 
@@ -1426,11 +1534,7 @@ mod tests {
         std::fs::write(dir.path().join("web.role"), "allowed_ports: [80]\n").expect("write role");
         let shared = state(
             vec![],
-            vec![openstack_site_with_firewall(
-                "rent",
-                "rent.do.top",
-                Some(dir.path()),
-            )],
+            vec![openstack_site_with_firewall("rent", "rent.do.top", dir.path())],
         );
         let fake = Arc::new(FakeResolver::ok(resolved(Some([203, 0, 113, 10]), None)));
         inject_resolver(&shared, "prod", fake.clone());
@@ -1447,11 +1551,7 @@ mod tests {
         std::fs::write(dir.path().join("web.role"), "allowed_ports: [80]\n").expect("write role");
         let shared = state(
             vec![],
-            vec![openstack_site_with_firewall(
-                "rent",
-                "rent.do.top",
-                Some(dir.path()),
-            )],
+            vec![openstack_site_with_firewall("rent", "rent.do.top", dir.path())],
         );
         inject_resolver(&shared, "prod", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
 
@@ -1469,11 +1569,7 @@ mod tests {
         .expect("write role");
         let shared = state(
             vec![],
-            vec![openstack_site_with_firewall(
-                "rent",
-                "rent.do.top",
-                Some(dir.path()),
-            )],
+            vec![openstack_site_with_firewall("rent", "rent.do.top", dir.path())],
         );
         inject_resolver(&shared, "prod", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
 

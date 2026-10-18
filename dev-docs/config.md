@@ -20,7 +20,7 @@ config/
 ```
 
 - `sites/` 下所有 `*.yaml` 一起构成 `Config`；`openstack/` 下所有 `*.yaml` 一起构成 `Config.openstack_envs`（键 = 文件 stem）。重复/冲突在加载时整体校验（见 §6）。
-- `firewall` 目录路径在**每个 openstack 站点内**配置（`firewall_dir`），因此不同站点可指向不同目录。
+- `firewall` 目录路径在**每个 openstack 站点内**配置（`firewall_dir`，**必填**），因此不同站点可指向不同目录。
 - 全部加载逻辑是纯函数 `load_config(sites_dir: &Path, envs_dir: &Path, env: &HashMap<String, String>) -> Result<Config>`，供启动与 `reload` 复用（见 `reload.md`）。`envs_dir` 不存在或非目录 = **无任何环境**（`Ok(空)`）；任一环境文件坏则整份加载失败。
 
 ## 2. 通用字段
@@ -31,7 +31,7 @@ config/
 |---|---|---|---|
 | `name` | string | 是 | 站点标识，仅用于日志/指标/错误定位，必须唯一 |
 | `mode` | enum | 是 | `forward` \| `openstack` |
-| `http` | 布尔 | 否 | 是否响应 HTTP（80 端口），默认 `true` |
+| `http` | 布尔 | 否 | 是否响应明文 HTTP（80 端口），默认 `true`；`false` 时该站点在明文监听器上返回 404（HTTPS-only 站点，拒绝明文降级） |
 | `https` | 布尔 | 是 | 是否启用 HTTPS（443 端口） |
 | `listen.http_port` / `listen.https_port` | int | 否 | v1 不接受：监听固定共享 `0.0.0.0:80`/`0.0.0.0:443`（design.md §4.1；测试换端口在 main 装配层进行，不进配置） |
 
@@ -109,13 +109,13 @@ https: true
 cert_file: /etc/iris/certs/rent.do.top.crt
 key_file:  /etc/iris/certs/rent.do.top.key
 
-firewall_dir: /etc/iris/firewall # 可选；配置后按 firewall.md 强制执行 ACL
+firewall_dir: /etc/iris/firewall # 必填；按 firewall.md 强制执行 ACL（default-deny）
 
 openstack_env: prod              # 必填；引用 <config-dir>/openstack/prod.yaml（§4.1）
 ```
 
 - `base_domain`：openstack 站点的根域；形如 `{instance}-{port}.{base_domain}` 的 Host 命中（§8 解析规则）。
-- `firewall_dir`：可选。**配置后即强制执行** ACL（无 role 或端口未开放 → 拒绝）；未配置则不校验（见 `firewall.md` §4 的决策说明）。
+- `firewall_dir`：**必填**。目录必须存在，缺失或不存在 → 加载校验失败（`ConfigError::Validate`，reload 时保持旧配置）。ACL 恒定强制执行（无 role 或端口未开放 → 403 拒绝）；不再存在"未配置防火墙"的跳过路径（见 `firewall.md` §4）。
 - `openstack_env`：**必填**。站点文件**不再接受内嵌 `openstack:` 块**（旧格式 → Parse 错误）；必须引用一个已加载的环境，否则整份配置校验失败（§6）。引用方式也适用于 forward 站点的 instance 后端（§3）。
 
 ### 4.1 独立环境文件（`<config-dir>/openstack/<env-name>.yaml`）
@@ -184,7 +184,7 @@ nova:
    - `domain` 不得与 `base_domain` 重叠。
    - HTTPS 站点证书/密钥文件存在且可读（`reload` 时对文件变更做 stat，内容变更在 SNI 选择时天然生效）。
    - forward：`backends` 非空；每个条目恰设 `addr`（可解析为 `IP:port`）或 `instance`（非空、带 `port`）之一；**有 instance 后端时 `openstack_env` 必填且引用存在**；`weight` 在 `0..=65535`。
-   - openstack 站点：`openstack_env` 必填且引用存在；`firewall_dir` 若配置则目录存在。
+   - openstack 站点：`openstack_env` 必填且引用存在；`firewall_dir` **必填**且必须是已存在的目录（缺失或不存在 → `Validate` 失败）。
    - openstack 环境文件：`auth.api_url` 为有效 http(s) URL；凭据方式字段齐备（`password` / `application_credential` 的字段集互斥）；`cache_ttl_secs` 在 `[60, 7*86400]`（至少 1 分钟、最多 7 天，防止配置性价比倒挂）；`timeout_secs` 在 `[1, 600]`（0 会导致每次 Nova 请求瞬时失败）。
    - 站点引用的 `openstack_env` 必须存在于已加载的 `Config.openstack_envs`，否则 `Validate` 失败。
    - `port` 合法性上限：解析出的端口 `1..=65535`（见 §8）。

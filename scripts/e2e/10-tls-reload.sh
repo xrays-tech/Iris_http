@@ -34,11 +34,12 @@ WORK="target/e2e-p10"
 CFG_DIR="$WORK/config"
 SITES_DIR="$CFG_DIR/sites"
 ENVS_DIR="$CFG_DIR/openstack"
+FW_DIR="$CFG_DIR/firewall"
 LOG_DIR="$WORK/logs"
 PIDFILE="$WORK/iris.pid"
 
 rm -rf "$WORK"
-mkdir -p "$SITES_DIR" "$ENVS_DIR" "$LOG_DIR"
+mkdir -p "$SITES_DIR" "$ENVS_DIR" "$FW_DIR" "$LOG_DIR"
 
 echo "[build] cargo build --bin iris"
 cargo build --bin iris --quiet
@@ -83,6 +84,11 @@ auth:
   application_credential_secret: e2e-secret
 nova: {}
 YAML
+  # openstack sites require a firewall_dir (P16).
+  cat > "$FW_DIR/INS001.role" <<YAML
+allowed_ports:
+  - 80
+YAML
   cat > "$SITES_DIR/003-openstack-wildcard.yaml" <<YAML
 name: rent
 mode: openstack
@@ -91,6 +97,7 @@ http: true
 https: true
 cert_file: $CERTS/rent.do.top.crt
 key_file: $CERTS/rent.do.top.key
+firewall_dir: $FW_DIR
 openstack_env: prod
 YAML
 }

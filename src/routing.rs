@@ -286,7 +286,7 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
-            firewall_dir: None,
+            firewall_dir: std::path::PathBuf::from("tests/fixtures/openstack-firewall"),
             openstack_env: "prod".to_owned(),
         }
     }

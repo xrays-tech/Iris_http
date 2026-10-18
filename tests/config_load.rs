@@ -66,8 +66,14 @@ fn forward_yaml(body_after_mode: &str) -> String {
 }
 
 /// An openstack site YAML referencing the default `prod` environment.
+///
+/// `firewall_dir` is required since P16; point it at the committed unit-test
+/// firewall directory.
 fn openstack_yaml(body_after_env: &str) -> String {
-    format!("name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\nopenstack_env: prod\n{body_after_env}")
+    format!(
+        "name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\n\
+         firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: prod\n{body_after_env}"
+    )
 }
 
 fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -553,7 +559,7 @@ fn valid_openstack_password_site_expands_env() {
     assert_eq!(o.openstack_env, "prod");
     assert_eq!(o.base_domain, "rent.do.top");
     assert!(o.https);
-    assert_eq!(o.firewall_dir.as_deref(), Some(fw.as_path()));
+    assert_eq!(o.firewall_dir, fw);
 
     let prod = cfg.openstack_envs.get("prod").expect("prod env");
     assert_eq!(prod.config.timeout_secs, 5);
@@ -642,7 +648,8 @@ fn openstack_inline_block_is_rejected() {
 
 #[test]
 fn openstack_unknown_env_rejected() {
-    let yaml = "name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\nopenstack_env: ghost\n";
+    let yaml = "name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\n\
+                firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: ghost\n";
     let err = load_err(&[("o.yaml", yaml)], &HashMap::new());
     assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
 }
@@ -687,7 +694,8 @@ fn openstack_cache_ttl_bounds_inclusive() {
 
 #[test]
 fn openstack_invalid_base_domain_rejected() {
-    let yaml = "name: rent\nmode: openstack\nbase_domain: https://rent.do.top\nhttps: false\nopenstack_env: prod\n";
+    let yaml = "name: rent\nmode: openstack\nbase_domain: https://rent.do.top\nhttps: false\n\
+                firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: prod\n";
     let err = load_err(&[("o.yaml", yaml)], &HashMap::new());
     assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
 }
@@ -736,10 +744,19 @@ fn openstack_unknown_approach_rejected() {
 
 #[test]
 fn openstack_missing_firewall_dir_rejected() {
-    let err = load_err(
-        &[("o.yaml", &openstack_yaml("firewall_dir: /no/such/firewall/dir\n"))],
-        &HashMap::new(),
-    );
+    // `firewall_dir` is required (P16): a site that omits it is rejected so an
+    // openstack wildcard site can never become an ACL-free arbitrary-port proxy.
+    let yaml =
+        "name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\nopenstack_env: prod\n";
+    let err = load_err(&[("o.yaml", yaml)], &HashMap::new());
+    assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
+}
+
+#[test]
+fn openstack_nonexistent_firewall_dir_rejected() {
+    let yaml = "name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\n\
+                firewall_dir: /no/such/firewall/dir\nopenstack_env: prod\n";
+    let err = load_err(&[("o.yaml", yaml)], &HashMap::new());
     assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
 }
 
@@ -821,16 +838,20 @@ fn duplicate_domain_rejected() {
 
 #[test]
 fn duplicate_base_domain_rejected() {
-    let a = "name: rent-a\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\nopenstack_env: prod\n";
-    let b = "name: rent-b\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\nopenstack_env: prod\n";
+    let a = "name: rent-a\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\n\
+             firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: prod\n";
+    let b = "name: rent-b\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\n\
+             firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: prod\n";
     let err = load_err(&[("a.yaml", a), ("b.yaml", b)], &HashMap::new());
     assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
 }
 
 #[test]
 fn overlapping_base_domains_rejected() {
-    let parent = "name: p\nmode: openstack\nbase_domain: example.com\nhttps: false\nopenstack_env: prod\n";
-    let child = "name: c\nmode: openstack\nbase_domain: a.example.com\nhttps: false\nopenstack_env: prod\n";
+    let parent = "name: p\nmode: openstack\nbase_domain: example.com\nhttps: false\n\
+                  firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: prod\n";
+    let child = "name: c\nmode: openstack\nbase_domain: a.example.com\nhttps: false\n\
+                 firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: prod\n";
     let err = load_err(&[("p.yaml", parent), ("c.yaml", child)], &HashMap::new());
     assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
 }
@@ -838,7 +859,8 @@ fn overlapping_base_domains_rejected() {
 #[test]
 fn forward_domain_overlaps_base_domain_rejected() {
     let fwd = "name: f\nmode: forward\ndomain: www.rent.do.top\nhttps: false\nbackends:\n  - addr: 10.0.0.1:80\n";
-    let os = "name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\nopenstack_env: prod\n";
+    let os = "name: rent\nmode: openstack\nbase_domain: rent.do.top\nhttps: false\n\
+              firewall_dir: tests/fixtures/openstack-firewall\nopenstack_env: prod\n";
     let err = load_err(&[("f.yaml", fwd), ("o.yaml", os)], &HashMap::new());
     assert!(matches!(err, ConfigError::Validate(_)), "got {err:?}");
 }

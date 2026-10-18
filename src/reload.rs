@@ -146,12 +146,11 @@ pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadEr
     let mut firewall: HashMap<String, Arc<FirewallTable>> =
         HashMap::with_capacity(cfg.openstack.len());
     for site in &cfg.openstack {
-        if let Some(dir) = &site.firewall_dir {
-            let table = build_firewall(dir).map_err(|err| {
-                ReloadError::build("firewall", format!("site '{}': {err}", site.name))
-            })?;
-            firewall.insert(site.name.clone(), Arc::new(table));
-        }
+        // `firewall_dir` is required (P16), so every site gets a table.
+        let table = build_firewall(&site.firewall_dir).map_err(|err| {
+            ReloadError::build("firewall", format!("site '{}': {err}", site.name))
+        })?;
+        firewall.insert(site.name.clone(), Arc::new(table));
     }
 
     let certs = SniCertMap::from_sites(&cfg)
@@ -531,6 +530,9 @@ mod tests {
         }
     }
 
+    /// The required `firewall_dir` for reload-test openstack sites (P16).
+    const FW_DIR: &str = "tests/fixtures/openstack-firewall";
+
     fn openstack_site(name: &str, base_domain: &str) -> OpenStackSite {
         OpenStackSite {
             name: name.to_owned(),
@@ -539,7 +541,7 @@ mod tests {
             https: false,
             cert_file: None,
             key_file: None,
-            firewall_dir: None,
+            firewall_dir: std::path::PathBuf::from(FW_DIR),
             openstack_env: "prod".to_owned(),
         }
     }
@@ -762,11 +764,15 @@ mod tests {
         std::fs::write(dir.path().join("web.role"), "allowed_ports: [80\n").expect("write role");
 
         let mut bad = config_a();
-        bad.openstack[0].firewall_dir = Some(dir.path().to_path_buf());
+        bad.openstack[0].firewall_dir = dir.path().to_path_buf();
 
         let err = apply_new_config(&state, bad).expect_err("bad role must reject the reload");
         assert!(matches!(err, ReloadError::Build { component, .. } if component == "firewall"));
-        assert_eq!(state.config().openstack[0].firewall_dir, None);
+        // The rejected reload kept the previously published configuration.
+        assert_eq!(
+            state.config().openstack[0].firewall_dir,
+            std::path::PathBuf::from(FW_DIR)
+        );
     }
 
     // ----- resolver cache retention -----
