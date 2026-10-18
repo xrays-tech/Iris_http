@@ -28,7 +28,10 @@ use self::cache::{
     build_cache, random_basis_points, ttl_for, Breaker, CacheEntry, DiscoveryCache, FlightMap,
     FlightRole, LeaderGuard, Stored, TokenCache, BREAKER_THRESHOLD,
 };
-use self::nova::{exact_name_match, query_servers, select_address, NovaError, NovaServer};
+use self::nova::{
+    exact_name_match, is_instance_uuid, query_server_by_id, query_servers, select_address,
+    NovaError, NovaServer,
+};
 use crate::config::{Config, OpenStackConfig};
 
 /// HTTP client shared by all discovery calls (pooled connections).
@@ -171,9 +174,9 @@ struct OpenStackFetcher {
 }
 
 impl OpenStackFetcher {
-    fn pick(instance: &str, servers: &[NovaServer]) -> Result<ResolvedInstance, FetchError> {
-        let server = exact_name_match(instance, servers).ok_or(FetchError::NotFound)?;
-        let selection = select_address(server);
+    /// Map a single Nova server onto its selected upstream address.
+    fn pick(server: NovaServer) -> Result<ResolvedInstance, FetchError> {
+        let selection = select_address(&server);
         if selection.is_empty() {
             return Err(FetchError::NoAddress);
         }
@@ -190,20 +193,32 @@ impl OpenStackFetcher {
         }
     }
 
-    async fn query(
-        &self,
-        instance: &str,
-        token: &Token,
-    ) -> Result<Vec<NovaServer>, NovaError> {
-        query_servers(
-            &self.client,
-            &token.value,
-            &self.base(token),
-            instance,
-            self.all_tenants,
-            self.timeout,
-        )
-        .await
+    /// Look `instance` up on Nova. UUID-shaped input goes to show-by-id
+    /// (`GET /servers/{uuid}`); anything else is an exact-name list query.
+    async fn query(&self, instance: &str, token: &Token) -> Result<NovaServer, NovaError> {
+        if is_instance_uuid(instance) {
+            query_server_by_id(
+                &self.client,
+                &token.value,
+                &self.base(token),
+                instance,
+                self.timeout,
+            )
+            .await
+        } else {
+            let servers = query_servers(
+                &self.client,
+                &token.value,
+                &self.base(token),
+                instance,
+                self.all_tenants,
+                self.timeout,
+            )
+            .await?;
+            exact_name_match(instance, &servers)
+                .cloned()
+                .ok_or(NovaError::NotFound)
+        }
     }
 }
 
@@ -217,7 +232,7 @@ impl Fetcher for OpenStackFetcher {
             .map_err(map_auth_error)?;
 
         match self.query(instance, &token).await {
-            Ok(servers) => Self::pick(instance, &servers),
+            Ok(server) => Self::pick(server),
             Err(NovaError::Unauthorized) => {
                 // Refresh once and retry (`discovery.md` §3).
                 let token = self
@@ -226,7 +241,7 @@ impl Fetcher for OpenStackFetcher {
                     .await
                     .map_err(map_auth_error)?;
                 match self.query(instance, &token).await {
-                    Ok(servers) => Self::pick(instance, &servers),
+                    Ok(server) => Self::pick(server),
                     Err(NovaError::Unauthorized) => Err(FetchError::AuthFailed),
                     Err(err) => Err(map_nova_error(err)),
                 }
@@ -435,6 +450,27 @@ pub fn build_resolvers(config: &Config) -> HashMap<String, Arc<dyn Resolver>> {
             let resolver: Arc<dyn Resolver> =
                 Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client)));
             Some((site.name.clone(), resolver))
+        })
+        .collect()
+}
+
+/// Build one shared [`Resolver`] per OpenStack environment, keyed by
+/// environment name (C2 — the env-keyed successor to [`build_resolvers`]).
+///
+/// Every consumer of an environment (openstack wildcard sites and forward
+/// sites with instance backends) shares the same resolver instance, and thus
+/// the same cache / single-flight / circuit-breaker / last-known-good state.
+/// All resolvers share a single [`HttpClient`] so Keystone/Nova connections are
+/// pooled across every environment.
+pub fn build_env_resolvers(config: &Config) -> HashMap<String, Arc<dyn Resolver>> {
+    let client = Arc::new(HttpClient::new());
+    config
+        .openstack_envs
+        .iter()
+        .map(|(name, env)| {
+            let resolver: Arc<dyn Resolver> =
+                Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client)));
+            (name.clone(), resolver)
         })
         .collect()
 }

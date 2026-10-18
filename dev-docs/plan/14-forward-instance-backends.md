@@ -140,3 +140,36 @@ C1→C2→C3 串行（C2/C3 都依赖 C1 类型；C2/C3 均触碰 state/reload/p
 - 生产代码无 unwrap/expect/panic/unreachable/todo/unimplemented；无签名偏离。
 
 发现（供 C3）：C1 过渡期抢答 `BackendTarget::Instance` 站点池为空 → `select` 为 `None`，由 proxy 层映射 502；Instance 池/健康/解析复用留给 C3。
+
+## C2 发现层 — 阶段记录
+
+状态：**完成**（commit `P14-C2: ...`）。
+
+实现要点（与上方 C2 TDD 清单一致）：
+
+- `src/openstack/nova.rs`：
+  - `is_instance_uuid(s)`：8-4-4-4-12 十六进制、大小写不敏感；长度/分隔符/非 hex → false。作为 `resolve` 的 UUID 优先级判据（UUID 形状一律走 show-by-id，即便原意是名称）。
+  - `decode_server(body)`：解析单实例信封 `{"server":{...}}`（复用内部 `ServerEnvelope`）；空/畸形/仅 list 信封 → `NovaError::Decode`。
+  - 新增 `pub(crate) async fn query_server_by_id(...)`：`GET /v2.1/servers/{uuid}`；与 `query_servers` 共用标准头与状态映射。
+  - 抽取私有 `get_json`（标准 Nova 头 + 超时/传输错误映射）与 `check_status`（401/403/404/其它非 2xx → 对应 `NovaError`）；`query_servers` 内部改为复用，**签名与行为不变**。
+- `src/openstack/mod.rs`：
+  - `OpenStackFetcher::query` 判别 `is_instance_uuid`：UUID → show-by-id；否则原名称列表 + `exact_name_match`。既有 401 单次刷新重试与错误映射（NotFound/AuthFailed/Transient）对两路一致。
+  - `Resolver::resolve` 因此免费继承既有缓存/单飞/熔断/fail-open mixin（`resolve` 核心未改）。
+  - **新增 `pub fn build_env_resolvers(config)`**：键=环境名（`openstack_envs` key），每个环境一个共享 `OpenStackResolver`（缓存/单飞/熔断/last-known-good 共享），全部共享一个 `HttpClient`。既有 `build_resolvers`（站点名键）**签名与实现保持原样**（C3 才切换/删除）。
+- `scripts/mock_openstack.py`：新增 `GET /v2.1/servers/{uuid}` show-by-id（读 `<servers-dir>/<uuid>.json`，缺→404）；名称列表与 token 端点行为不变；名称列表与 show-by-id 共用 `_nova_gate`（`--servers-status`/`--delay`/`--servers-unauthorized-once`）与 `_send_fixture`；`--record` 继续记录 method/path/query 供断言。
+- fixtures：新增 `tests/fixtures/openstack/servers/11111111-....json`（multi-nic 单信封，floating+fixed）与 `33333333-....json`（fixed-only 单信封）。
+- `tests/openstack.rs`：新增 6 例——uuid show-by-id（断言记录路径=`/v2.1/servers/{uuid}`、无 query）、UUID 优先级（无 `name=` query）、名称路径回归（`name=multi-nic&all_tenants=true`）、uuid+name 混用（token 复用恰 1 次）、uuid 404→NotFound、env 键共享（同 env 两次 resolve 仅 1 次 Nova GET）。
+- nova.rs 单测：`is_instance_uuid` 正/反例、`decode_server` 单信封/畸形。
+
+验证输出：
+
+- `cargo build`：0 warning / 0 error；`cargo build --tests`：0 warning / 0 error。
+- `cargo test`：**327 passed / 0 failed**（6 suites）：lib 221、bin 7、`config_load` 71、`firewall` 11、`openstack` 17。（基线 317 → +10：nova 单测 4 + openstack 集成 6）
+- e2e：`04-tls`、`07-openstack`、`08-reload`、`10-tls-reload` 全部 PASS（07 为本 lane 最相关，迁移后仍全绿）。
+- 生产代码无 unwrap/expect/panic/unreachable/todo/unimplemented（仅 `#[cfg(test)]` 豁免）。
+
+偏离/新增（供审阅）：
+
+- nova.rs 新增 `pub(crate) async fn query_server_by_id`（契约未列；作为 show-by-id 网络层归属地，非签名变更、未扩公共 API）。
+- 契约未规定 `decode_server` 对 list-only 信封的行为——本实现严格只接受 `{"server":{...}}`，list-only/畸形 → `Decode`（单实例语义）。
+- `NovaError` 未新增变体；无其它签名偏离。

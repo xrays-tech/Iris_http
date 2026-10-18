@@ -7,8 +7,12 @@ Implements the P5/P7 contract from ``dev-docs/plan/12-mock-fixtures.md``:
   Nova catalog (``type=compute``, public URL pointing at this mock's ``/v2.1``).
 * ``GET /v2.1/servers?name=<name>&all_tenants=true`` -> ``200`` JSON from
   ``--servers-dir/<name>.json`` (``404`` when absent), or a forced status/timeout.
+* ``GET /v2.1/servers/<uuid>`` (Nova show-by-id) -> ``200`` single-server
+  envelope from ``--servers-dir/<uuid>.json`` (``404`` when absent), sharing the
+  same forced-status/timeout/401-once gates as the name query.
 * Every request's ``X-Auth-Token`` / ``OpenStack-API-Version`` (and method/path)
-  is appended as one JSON line to ``--record`` so tests can prove token reuse.
+  is appended as one JSON line to ``--record`` so tests can prove token reuse
+  and assert which endpoint (name query vs show-by-id) was hit.
 
 Python standard library only. Prints ``LISTENING <port>`` on stdout once bound.
 """
@@ -140,12 +144,21 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         _record("GET", parsed.path, parsed.query, self.headers)
-        if parsed.path.rstrip("/").endswith("/servers"):
+        path = parsed.path.rstrip("/")
+        if path.endswith("/servers"):
             self._handle_servers(parsed)
+        elif "/servers/" in path:
+            server_id = path.rsplit("/", 1)[1]
+            self._handle_server_show(server_id)
         else:
             self._error(404, "unknown GET endpoint")
 
-    def _handle_servers(self, parsed) -> None:
+    def _nova_gate(self) -> bool:
+        """Shared forced-status / delay / 401-once gates for Nova endpoints.
+
+        Returns ``True`` when an error reply has already been sent, so the
+        caller must stop; ``False`` when the request may proceed.
+        """
         global _UNAUTHORIZED_SERVED
         if _OPTIONS.servers_unauthorized_once:
             with _STATE_LOCK:
@@ -153,11 +166,25 @@ class Handler(BaseHTTPRequestHandler):
                 _UNAUTHORIZED_SERVED = True
             if first:
                 self._error(401, "token expired")
-                return
+                return True
         if _OPTIONS.delay > 0:
             time.sleep(_OPTIONS.delay)
         if _OPTIONS.servers_status is not None:
             self._error(_OPTIONS.servers_status, "forced status")
+            return True
+        return False
+
+    def _send_fixture(self, fixture: str) -> None:
+        with open(fixture, "rb") as handle:
+            body = handle.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_servers(self, parsed) -> None:
+        if self._nova_gate():
             return
 
         name = (parse_qs(parsed.query).get("name") or [""])[0]
@@ -169,13 +196,19 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isfile(fixture):
             self._error(404, "instance not found")
             return
-        with open(fixture, "rb") as handle:
-            body = handle.read()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_fixture(fixture)
+
+    def _handle_server_show(self, server_id: str) -> None:
+        if self._nova_gate():
+            return
+        if not _OPTIONS.servers_dir:
+            self._error(404, "instance not found")
+            return
+        fixture = os.path.join(_OPTIONS.servers_dir, f"{server_id}.json")
+        if not os.path.isfile(fixture):
+            self._error(404, "instance not found")
+            return
+        self._send_fixture(fixture)
 
 
 def _parse_args(argv) -> argparse.Namespace:

@@ -96,6 +96,23 @@ impl fmt::Display for NovaError {
 
 impl std::error::Error for NovaError {}
 
+/// Whether `s` is a canonical Nova server UUID (`8-4-4-4-12` hex digits,
+/// case-insensitive).
+///
+/// This is the precedence discriminator for [`crate::openstack::Resolver::resolve`]:
+/// a UUID-shaped string is always resolved through Nova show-by-id, so an
+/// instance *name* that happens to match this shape is treated as a UUID.
+pub fn is_instance_uuid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(idx, &byte)| match idx {
+        8 | 13 | 18 | 23 => byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    })
+}
+
 /// Wire envelope: Nova uses either `{"servers": [...]}` (list) or
 /// `{"server": {...}}` (single) depending on the endpoint.
 #[derive(Deserialize)]
@@ -118,6 +135,19 @@ pub fn decode_server_list(body: &[u8]) -> Result<Vec<NovaServer>, NovaError> {
         )),
     }
 }
+
+/// Decode a Nova show-by-id payload (`{"server": {...}}`) into a single server.
+///
+/// Reuses the same envelope decoding as [`decode_server_list`] but requires the
+/// single-server form; a list-only or malformed body is a [`NovaError::Decode`].
+pub fn decode_server(body: &[u8]) -> Result<NovaServer, NovaError> {
+    let envelope: ServerEnvelope =
+        serde_json::from_slice(body).map_err(|err| NovaError::Decode(err.to_string()))?;
+    envelope.server.ok_or_else(|| {
+        NovaError::Decode("response contained no 'server' object".to_owned())
+    })
+}
+
 
 /// Find the server whose `name` equals `name` byte-for-byte.
 ///
@@ -191,6 +221,51 @@ fn first_of(entries: &[(IpAddr, IpKind)], ipv4: bool, kind: IpKind) -> Option<Ip
         .map(|(ip, _)| *ip)
 }
 
+/// Map a Nova HTTP status onto the [`NovaError`] taxonomy (2xx = `Ok`).
+fn check_status(status: u16) -> Result<(), NovaError> {
+    match status {
+        401 => Err(NovaError::Unauthorized),
+        403 => Err(NovaError::Forbidden),
+        404 => Err(NovaError::NotFound),
+        code if !(200..300).contains(&code) => Err(NovaError::Status(code)),
+        _ => Ok(()),
+    }
+}
+
+/// `GET url` with the standard Nova headers, mapping transport failures and
+/// non-2xx statuses; returns the raw body bytes.
+async fn get_json(
+    client: &HttpClient,
+    url: Url,
+    token: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, NovaError> {
+    let response = client
+        .inner()
+        .get(url)
+        .header("X-Auth-Token", token)
+        .header("OpenStack-API-Version", "compute 2.1")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|err| {
+            if err.is_timeout() {
+                NovaError::Timeout
+            } else {
+                NovaError::Http(err.to_string())
+            }
+        })?;
+
+    check_status(response.status().as_u16())?;
+
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|err| NovaError::Http(err.to_string()))
+}
+
 /// Query Nova for servers matching `instance` (`GET /servers?name=...`).
 ///
 /// `all_tenants=true` is appended when configured, so an admin principal can
@@ -216,37 +291,29 @@ pub async fn query_servers(
         }
     }
 
-    let response = client
-        .inner()
-        .get(url)
-        .header("X-Auth-Token", token)
-        .header("OpenStack-API-Version", "compute 2.1")
-        .header(reqwest::header::ACCEPT, "application/json")
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(|err| {
-            if err.is_timeout() {
-                NovaError::Timeout
-            } else {
-                NovaError::Http(err.to_string())
-            }
-        })?;
-
-    let status = response.status().as_u16();
-    match status {
-        401 => return Err(NovaError::Unauthorized),
-        403 => return Err(NovaError::Forbidden),
-        404 => return Err(NovaError::NotFound),
-        code if !(200..300).contains(&code) => return Err(NovaError::Status(code)),
-        _ => {}
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| NovaError::Http(err.to_string()))?;
+    let bytes = get_json(client, url, token, timeout).await?;
     decode_server_list(&bytes)
+}
+
+/// Query Nova for one server by id (`GET /servers/{uuid}`, show-by-id).
+///
+/// Used for UUID-shaped instances; a missing id is [`NovaError::NotFound`].
+pub(crate) async fn query_server_by_id(
+    client: &HttpClient,
+    token: &str,
+    nova_base: &Url,
+    uuid: &str,
+    timeout: Duration,
+) -> Result<NovaServer, NovaError> {
+    let mut url = nova_base.clone();
+    url.path_segments_mut()
+        .map_err(|_| NovaError::Http("nova base URL cannot be a base URL".to_owned()))?
+        .pop_if_empty()
+        .push("servers")
+        .push(uuid);
+
+    let bytes = get_json(client, url, token, timeout).await?;
+    decode_server(&bytes)
 }
 
 #[cfg(test)]
@@ -313,6 +380,57 @@ mod tests {
     fn decode_rejects_missing_envelope() {
         assert!(matches!(
             decode_server_list(br#"{"other": 1}"#).unwrap_err(),
+            NovaError::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn is_instance_uuid_accepts_canonical_shapes() {
+        assert!(is_instance_uuid("11111111-1111-1111-1111-111111111111"));
+        assert!(is_instance_uuid("abcdef01-2345-6789-abcd-ef0123456789"));
+        assert!(is_instance_uuid("ABCDEF01-2345-6789-ABCD-EF0123456789"));
+    }
+
+    #[test]
+    fn is_instance_uuid_rejects_non_uuids() {
+        for bad in [
+            "",
+            "web",
+            "web-1",
+            "11111111-1111-1111-1111-11111111111",   // one hex short
+            "11111111-1111-1111-1111-1111111111111", // one hex long
+            "11111111111111111111111111111111",      // no separators
+            "11111111_1111_1111_1111_111111111111",  // wrong separator
+            "g1111111-1111-1111-1111-111111111111",  // non-hex digit
+            "11111111-1111-1111-1111-11111111111z",  // non-hex tail
+            "deadbeef",
+        ] {
+            assert!(!is_instance_uuid(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn decode_server_reads_single_envelope() {
+        let body = include_bytes!(
+            "../../tests/fixtures/openstack/servers/11111111-1111-1111-1111-111111111111.json"
+        );
+        let server = decode_server(body).expect("single envelope decodes");
+        assert_eq!(server.id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(server.name, "multi-nic");
+        let selection = select_address(&server);
+        assert_eq!(selection.floating, Some(addr("203.0.113.10")));
+        assert_eq!(selection.fixed, Some(addr("192.168.1.10")));
+    }
+
+    #[test]
+    fn decode_server_rejects_malformed_and_list_only() {
+        assert!(matches!(
+            decode_server(b"{not json").unwrap_err(),
+            NovaError::Decode(_)
+        ));
+        assert!(matches!(decode_server(b"").unwrap_err(), NovaError::Decode(_)));
+        assert!(matches!(
+            decode_server(br#"{"servers": []}"#).unwrap_err(),
             NovaError::Decode(_)
         ));
     }
