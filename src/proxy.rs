@@ -91,18 +91,21 @@ pub struct IrisProxy {
 
 /// The `(https, site_name)` pair for a matched route, or `None` when the host
 /// matched no site. Reads the request's snapshot (FIX #3).
-pub fn site_facts(snapshot: &Snapshot, decision: &RouteDecision) -> Option<(bool, String)> {
+///
+/// The name is borrowed from the snapshot's config — the caller (a TLS-path
+/// check) never needs an owned copy (OPT-2: no per-request `site.name` clone).
+pub fn site_facts<'a>(snapshot: &'a Snapshot, decision: &RouteDecision) -> Option<(bool, &'a str)> {
     match decision {
         RouteDecision::Forward { site_idx, .. } => snapshot
             .config
             .forward
             .get(*site_idx)
-            .map(|site| (site.https, site.name.clone())),
+            .map(|site| (site.https, site.name.as_str())),
         RouteDecision::OpenStack { site_idx, .. } => snapshot
             .config
             .openstack
             .get(*site_idx)
-            .map(|site| (site.https, site.name.clone())),
+            .map(|site| (site.https, site.name.as_str())),
         RouteDecision::NotFound => None,
     }
 }
@@ -176,6 +179,38 @@ pub fn select_backend(
     match snapshot.lbs.get(site)?.as_ref() {
         ForwardBackends::Static(lb) => lb.select(client).map(PoolPick::Static),
         ForwardBackends::Instance(pool) => pool.select(client),
+    }
+}
+
+/// A selected pool pick plus, for an instance pick, the pool's cached
+/// resolution fetched in the same lock scope (OPT-3).
+struct ResolvedPick {
+    /// The selected entry.
+    pick: PoolPick,
+    /// The selected instance's cached resolution, when the pool had one.
+    cached: Option<ResolvedInstance>,
+}
+
+/// Select a backend for `site` and, for an instance pool, return the selected
+/// instance's cached resolution from the **same** lock scope (OPT-3).
+///
+/// This is the one-lock steady-state selection the forward instance path uses;
+/// it is behaviourally identical to [`select_backend`] plus a follow-up
+/// [`InstancePool::resolved`], but takes the pool lock once. A `None` result
+/// means no healthy, enabled upstream exists (a request-time `502`).
+fn select_pick(snapshot: &Snapshot, site: &str, client: Option<IpAddr>) -> Option<ResolvedPick> {
+    match snapshot.lbs.get(site)?.as_ref() {
+        ForwardBackends::Static(lb) => lb.select(client).map(|addr| ResolvedPick {
+            pick: PoolPick::Static(addr),
+            cached: None,
+        }),
+        ForwardBackends::Instance(pool) => {
+            let outcome = pool.pick(client);
+            outcome.pick.map(|pick| ResolvedPick {
+                pick,
+                cached: outcome.cached,
+            })
+        }
     }
 }
 
@@ -561,7 +596,7 @@ impl ProxyHttp for IrisProxy {
                 let same_site_as_sni = snapshot
                     .certs
                     .lookup(&sni)
-                    .map(|cert| cert.site() == site_name.as_str())
+                    .map(|cert| cert.site() == site_name)
                     .unwrap_or(false);
                 if should_421(site_https, same_site_as_sni) {
                     tracing::debug!(
@@ -656,7 +691,7 @@ impl ProxyHttp for IrisProxy {
                 })?
             }
             _ => {
-                let site = ctx.site.clone().ok_or_else(|| {
+                let site = ctx.site.as_deref().ok_or_else(|| {
                     Error::explain(
                         ErrorType::HTTPStatus(502),
                         "no forward site resolved for request",
@@ -665,40 +700,51 @@ impl ProxyHttp for IrisProxy {
 
                 // An instance pick is pinned for a retry (so the fallback
                 // retries the same instance); everything else re-selects here
-                // so each attempt re-runs load balancing.
-                let pick = match reuse_pick(&ctx.pool_pick, ctx.retries) {
-                    Some(pinned) => pinned,
+                // so each attempt re-runs load balancing. A fresh selection
+                // fetches the instance's cached resolution from the same lock
+                // scope (OPT-3).
+                let picked = match reuse_pick(&ctx.pool_pick, ctx.retries) {
+                    Some(pinned) => ResolvedPick {
+                        pick: pinned,
+                        cached: None,
+                    },
                     None => {
-                        let pick = select_backend(snapshot, &site, client_ip(session))
-                            .ok_or_else(|| {
+                        let selected = select_pick(snapshot, site, client_ip(session)).ok_or_else(
+                            || {
                                 Error::explain(
                                     ErrorType::HTTPStatus(502),
                                     format!("no healthy upstream for forward site '{site}'"),
                                 )
-                            })?;
-                        ctx.pool_pick = Some(pick.clone());
-                        pick
+                            },
+                        )?;
+                        ctx.pool_pick = Some(selected.pick.clone());
+                        selected
                     }
                 };
 
-                match pick {
+                match picked.pick {
                     PoolPick::Static(addr) => {
                         ctx.resolved = None;
                         addr
                     }
                     PoolPick::Instance { instance, port } => {
                         // Record the resolution on the Ctx so `fail_to_connect`
-                        // can fall back to this same pick's fixed address.
-                        let resolved = resolve_instance_pick(snapshot, &site, &instance)
-                            .await
-                            .ok_or_else(|| {
-                                Error::explain(
-                                    ErrorType::HTTPStatus(502),
-                                    format!(
-                                        "forward instance '{instance}' on site '{site}' could not be resolved"
-                                    ),
-                                )
-                            })?;
+                        // can fall back to this same pick's fixed address. The
+                        // pool's cached resolution (from `select_pick`) avoids a
+                        // second lock; a miss resolves on the fly.
+                        let resolved = match picked.cached {
+                            Some(cached) => cached,
+                            None => resolve_instance_pick(snapshot, site, &instance)
+                                .await
+                                .ok_or_else(|| {
+                                    Error::explain(
+                                        ErrorType::HTTPStatus(502),
+                                        format!(
+                                            "forward instance '{instance}' on site '{site}' could not be resolved"
+                                        ),
+                                    )
+                                })?,
+                        };
                         ctx.resolved = Some(resolved);
                         pick_upstream(&resolved, port, ctx.use_fixed).ok_or_else(|| {
                             Error::explain(
@@ -1238,6 +1284,30 @@ mod tests {
             pick_instance_upstream(&snapshot, "apps", "INS001", 8080, false).await,
             Some(SocketAddr::from(([203, 0, 113, 10], 8080)))
         );
+    }
+
+    /// OPT-3: the steady-state selection returns the pool's cached resolution
+    /// in the same lock scope, so the proxy needs no second lock.
+    #[test]
+    fn select_pick_fetches_cached_resolution_in_one_call() {
+        let shared = instance_state(Arc::new(FakeResolver::err(
+            ResolveError::DiscoveryUnavailable("down".to_owned()),
+        )));
+        let snapshot = shared.snapshot();
+        let cached = resolved(Some([203, 0, 113, 10]), None);
+        match snapshot.lbs.get("apps").expect("pool").as_ref() {
+            crate::lb::ForwardBackends::Instance(pool) => pool.seed_resolution("INS001", cached),
+            crate::lb::ForwardBackends::Static(_) => panic!("expected an instance pool"),
+        }
+        let selected = select_pick(&snapshot, "apps", None).expect("a pick");
+        assert_eq!(
+            selected.pick,
+            PoolPick::Instance {
+                instance: "INS001".to_owned(),
+                port: 8080,
+            }
+        );
+        assert_eq!(selected.cached, Some(cached));
     }
 
     #[tokio::test]

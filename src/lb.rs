@@ -300,6 +300,15 @@ pub enum PoolPick {
     },
 }
 
+/// The outcome of one [`InstancePool::pick`]: the selected entry plus, from the
+/// same lock scope, the selected instance's cached resolution (OPT-3).
+pub(crate) struct PickOutcome {
+    /// The selected pool pick (`None` when no healthy, enabled entry exists).
+    pub(crate) pick: Option<PoolPick>,
+    /// The cached resolution for the selected instance, if any.
+    pub(crate) cached: Option<ResolvedInstance>,
+}
+
 /// Build the site-level backend pool: [`ForwardBackends::Static`] for an
 /// all-`addr` site, [`ForwardBackends::Instance`] once any backend references
 /// an instance.
@@ -357,6 +366,15 @@ struct PoolState {
     cursor: usize,
     /// Last successfully resolved address per instance identity.
     cached: HashMap<String, ResolvedInstance>,
+    /// Generation counter, bumped (under the lock) whenever the entry set or any
+    /// entry's health bit changes (OPT-1).
+    gen: u64,
+    /// Cached ketama ring with the generation it was built at (OPT-1).
+    ///
+    /// The ring is rebuilt only when `built_gen < gen` (or it is absent); its
+    /// input is the healthy/enabled entries' identity + weight, bit-identical
+    /// to the ring [`ketama_index`] builds inline.
+    ring_cache: Option<(u64, Vec<(u64, usize)>)>,
 }
 
 /// One enabled pool entry plus its observed health.
@@ -423,6 +441,8 @@ impl InstancePool {
                 entries: build_entries(backends, &HashMap::new()),
                 cursor: 0,
                 cached: HashMap::new(),
+                gen: 0,
+                ring_cache: None,
             }),
         }
     }
@@ -430,6 +450,19 @@ impl InstancePool {
     /// Select a healthy, enabled entry (`None` when every entry is unhealthy or
     /// disabled). `hash_key` (the client IP) is only used by ketama.
     pub fn select(&self, hash_key: Option<IpAddr>) -> Option<PoolPick> {
+        self.pick(hash_key).pick
+    }
+
+    /// Select a healthy, enabled entry **and**, in the same lock scope, return
+    /// the selected instance's cached resolution (OPT-3).
+    ///
+    /// This performs exactly the selection [`select`](Self::select) does, but
+    /// takes the state lock once so a steady-state instance request needs no
+    /// second lock to look up its cached address. `cached` is the pool's last
+    /// resolved address for the selected entry when it is an instance and a
+    /// probe (or seed) has cached one; a [`PoolPick::Static`] pick or an
+    /// uncached instance yields `None`.
+    pub(crate) fn pick(&self, hash_key: Option<IpAddr>) -> PickOutcome {
         let mut guard = lock(&self.state);
         // Deref once so `entries` / `cursor` are disjoint field borrows.
         let state = &mut *guard;
@@ -441,31 +474,67 @@ impl InstancePool {
             .map(|(idx, _)| idx)
             .collect();
         if healthy.is_empty() {
-            return None;
+            return PickOutcome {
+                pick: None,
+                cached: None,
+            };
         }
 
-        let position = match self.mode {
+        let Some(position) = (match self.mode {
             LbMode::RoundRobin => round_robin_pick(healthy.len(), &mut state.cursor),
             LbMode::WeightedRoundRobin => {
                 weighted_pick(&state.entries, &healthy, &mut state.cursor)
             }
             LbMode::Random => random_pick(healthy.len()),
             LbMode::Ketama => {
-                let nodes: Vec<(String, u32)> = healthy
-                    .iter()
-                    .map(|&idx| {
-                        let entry = &state.entries[idx];
-                        (entry.kind.identity(), entry.weight)
-                    })
-                    .collect();
-                ketama_index(&nodes, hash_key)
+                // Rebuild the ring only when the cached one is stale (OPT-1);
+                // the input is bit-identical to the inline `ketama_index` ring.
+                let current_gen = state.gen;
+                let stale = state
+                    .ring_cache
+                    .as_ref()
+                    .map(|(built_gen, _)| *built_gen < current_gen)
+                    .unwrap_or(true);
+                if stale {
+                    let nodes: Vec<(String, u32)> = healthy
+                        .iter()
+                        .map(|&idx| {
+                            let entry = &state.entries[idx];
+                            (entry.kind.identity(), entry.weight)
+                        })
+                        .collect();
+                    state.ring_cache = Some((current_gen, ring_from_nodes(&nodes)));
+                }
+                match state.ring_cache.as_ref() {
+                    Some((_, ring)) => ketama_lookup(ring, hash_key),
+                    None => None,
+                }
             }
-        }?;
+        }) else {
+            return PickOutcome {
+                pick: None,
+                cached: None,
+            };
+        };
 
-        state
-            .entries
-            .get(healthy[position])
-            .map(|entry| entry.kind.to_pick())
+        let entry = match state.entries.get(healthy[position]) {
+            Some(entry) => entry,
+            None => {
+                return PickOutcome {
+                    pick: None,
+                    cached: None,
+                }
+            }
+        };
+        let pick = entry.kind.to_pick();
+        let cached = match &pick {
+            PoolPick::Instance { instance, .. } => state.cached.get(instance).copied(),
+            PoolPick::Static(_) => None,
+        };
+        PickOutcome {
+            pick: Some(pick),
+            cached,
+        }
     }
 
     /// Replace the entry set, carrying the observed health of a retained
@@ -490,6 +559,9 @@ impl InstancePool {
 
         state.entries = entries;
         state.cursor = 0;
+        // A membership swap invalidates the ketama ring (OPT-1).
+        state.gen = state.gen.wrapping_add(1);
+        state.ring_cache = None;
     }
 
     /// The latest resolved address for `instance`, if any probe has cached one.
@@ -559,15 +631,28 @@ impl InstancePool {
 
         let mut state = lock(&self.state);
         let PoolState {
-            entries, cached, ..
+            entries,
+            cached,
+            gen,
+            ring_cache,
+            ..
         } = &mut *state;
+        let mut health_flipped = false;
         for entry in entries.iter_mut() {
             if let Some((healthy, resolved)) = updates.get(&entry.kind.health_key()) {
+                if entry.healthy != *healthy {
+                    health_flipped = true;
+                }
                 entry.healthy = *healthy;
                 if let Some((instance, resolved)) = resolved {
                     cached.insert(instance.clone(), *resolved);
                 }
             }
+        }
+        // A health-bit flip changes the ketama ring's input set (OPT-1).
+        if health_flipped {
+            *gen = gen.wrapping_add(1);
+            *ring_cache = None;
         }
     }
 }
@@ -642,10 +727,22 @@ fn random_pick(len: usize) -> Option<usize> {
 
 /// Pick a position within `nodes` (identity + weight) by consistent hashing of
 /// `key` (the client IP) over a ring of identity-keyed virtual nodes.
+///
+/// This is the uncached reference used by tests to validate the cached ring
+/// (OPT-1); production selection goes through [`InstancePool::pick`].
+#[cfg(test)]
 fn ketama_index(nodes: &[(String, u32)], key: Option<IpAddr>) -> Option<usize> {
     if nodes.is_empty() {
         return None;
     }
+    ketama_lookup(&ring_from_nodes(nodes), key)
+}
+
+/// Build the sorted ketama ring from `(identity, weight)` nodes.
+///
+/// Ring points are `(hash, position)`, where `position` indexes `nodes` — the
+/// exact ring [`ketama_index`] and the cached [`PoolState::ring_cache`] share.
+fn ring_from_nodes(nodes: &[(String, u32)]) -> Vec<(u64, usize)> {
     let mut ring: Vec<(u64, usize)> = Vec::new();
     for (position, (identity, weight)) in nodes.iter().enumerate() {
         let replicas = (*weight as usize).max(1) * KETAMA_REPLICAS;
@@ -654,7 +751,15 @@ fn ketama_index(nodes: &[(String, u32)], key: Option<IpAddr>) -> Option<usize> {
         }
     }
     ring.sort_by(|a, b| a.0.cmp(&b.0));
+    ring
+}
 
+/// Look up `key` on a prebuilt, sorted ketama `ring`, returning the ring
+/// point's position (an index into the node/healthy list).
+fn ketama_lookup(ring: &[(u64, usize)], key: Option<IpAddr>) -> Option<usize> {
+    if ring.is_empty() {
+        return None;
+    }
     let digest = hash_key(key);
     let index = match ring.binary_search_by(|point| point.0.cmp(&digest)) {
         Ok(index) => index,
@@ -1677,6 +1782,206 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(pool.select(client), first, "ketama must be sticky per client");
         }
+    }
+
+    // ----- OPT-1: cached ketama ring -----
+
+    /// The cached ring (rebuilt only on a membership/health change) must select
+    /// exactly what the uncached [`ketama_index`] reference selects for the same
+    /// node set.
+    #[test]
+    fn ketama_distribution_matches_previous_algorithm() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![
+                instance_backend("alpha", 8080, 3),
+                instance_backend("beta", 8080, 1),
+                instance_backend("gamma", 8080, 2),
+            ],
+            LbMode::Ketama,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+        // Reference ring input: healthy, enabled entries in order (identity+weight).
+        let nodes = vec![
+            ("alpha".to_owned(), 3u32),
+            ("beta".to_owned(), 1u32),
+            ("gamma".to_owned(), 2u32),
+        ];
+        for i in 0..2000u32 {
+            let client = ip4([10, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
+            let expected = ketama_index(&nodes, Some(client)).map(|pos| nodes[pos].0.clone());
+            assert_eq!(
+                instance_of(pool.select(Some(client))),
+                expected,
+                "cached ring must match the uncached algorithm for client {client}"
+            );
+        }
+    }
+
+    /// A ketama ring built once must be rebuilt only when the pool changes: a
+    /// health flip (via a probe) must be reflected, and the post-flip
+    /// distribution must equal a fresh ring over the surviving node.
+    #[tokio::test]
+    async fn ketama_ring_is_rebuilt_only_when_pool_changes() {
+        let (_listener, up) = listening_port();
+        let down = closed_port();
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![
+                instance_backend("alpha", up, 1),
+                instance_backend("beta", down, 1),
+            ],
+            LbMode::Ketama,
+            Some(tcp_health()),
+        )]);
+        // Both instances resolve to the same host; only alpha's port is live.
+        inject_resolver(&state, "prod", fake_ok(Some([127, 0, 0, 1]), None));
+        let pool = pool_for(&state, "apps");
+
+        let both = vec![("alpha".to_owned(), 1u32), ("beta".to_owned(), 1u32)];
+        let mut changed = false;
+        for i in 0..512u32 {
+            let client = ip4([10, 0, (i >> 8) as u8, i as u8]);
+            let expected = ketama_index(&both, Some(client)).map(|pos| both[pos].0.clone());
+            assert_eq!(
+                instance_of(pool.select(Some(client))),
+                expected,
+                "steady-state ring must match the full node set"
+            );
+            // Record whether this key actually distinguishes the two rings.
+            if expected.as_deref() == Some("beta") {
+                changed = true;
+            }
+        }
+        assert!(changed, "the two-node ring must reach beta for some client");
+
+        // The probe flips beta unhealthy: the ring must be rebuilt over alpha.
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+
+        let only_alpha = vec![("alpha".to_owned(), 1u32)];
+        for i in 0..512u32 {
+            let client = ip4([10, 0, (i >> 8) as u8, i as u8]);
+            let expected =
+                ketama_index(&only_alpha, Some(client)).map(|pos| only_alpha[pos].0.clone());
+            let actual = instance_of(pool.select(Some(client)));
+            assert_eq!(
+                actual, expected,
+                "post-flip ring must exclude the unhealthy node"
+            );
+            assert_eq!(actual.as_deref(), Some("alpha"));
+        }
+    }
+
+    /// `update` (an entry-set change) must invalidate the cached ring.
+    #[test]
+    fn ketama_ring_tracks_entry_set_update() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![
+                instance_backend("alpha", 8080, 1),
+                instance_backend("beta", 8080, 1),
+            ],
+            LbMode::Ketama,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+
+        pool.update(&[
+            instance_backend("alpha", 8080, 1),
+            instance_backend("gamma", 8080, 1),
+        ]);
+        let after = vec![("alpha".to_owned(), 1u32), ("gamma".to_owned(), 1u32)];
+        for i in 0..512u32 {
+            let client = ip4([10, 0, (i >> 8) as u8, i as u8]);
+            let expected = ketama_index(&after, Some(client)).map(|pos| after[pos].0.clone());
+            assert_eq!(instance_of(pool.select(Some(client))), expected);
+        }
+    }
+
+    // ----- OPT-3: single-lock pick -----
+
+    /// `pick` performs the same selection as `select` **and** returns the
+    /// selected instance's cached resolution from the same lock scope.
+    #[test]
+    fn pick_returns_cached_resolution_without_second_lock() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("alpha", 8080, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+
+        // No cached resolution yet: still selects, `cached` is `None`.
+        let first = pool.pick(None);
+        assert_eq!(
+            first.pick,
+            Some(PoolPick::Instance {
+                instance: "alpha".to_owned(),
+                port: 8080,
+            })
+        );
+        assert_eq!(first.cached, None);
+        // `select` delegates to `pick` (same pick).
+        assert_eq!(pool.select(None), first.pick.clone());
+
+        // A seeded resolution is returned in the same call.
+        let seeded = ResolvedInstance {
+            floating: Some(ip4([203, 0, 113, 10])),
+            fixed: None,
+        };
+        pool.seed_resolution("alpha", seeded);
+        let second = pool.pick(None);
+        assert_eq!(second.pick, first.pick);
+        assert_eq!(second.cached, Some(seeded));
+    }
+
+    /// A static entry carries no cached resolution.
+    #[test]
+    fn pick_static_entry_has_no_cached_resolution() {
+        let state = state_for(vec![instance_site(
+            "seed",
+            vec![instance_backend("seed", 8080, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let backends = [backend(7, 1)];
+        let pool = InstancePool::new("prod", &backends, &LbMode::RoundRobin, state.handle());
+        let outcome = pool.pick(None);
+        assert_eq!(outcome.pick, Some(PoolPick::Static(addr(7))));
+        assert_eq!(outcome.cached, None);
+    }
+
+    /// After an entry-set change, `pick` reflects the new entries and never
+    /// leaks a removed instance's cached resolution.
+    #[test]
+    fn pick_reflects_updated_entries() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("alpha", 8080, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+        let seeded = ResolvedInstance {
+            floating: Some(ip4([203, 0, 113, 10])),
+            fixed: None,
+        };
+        pool.seed_resolution("alpha", seeded);
+        assert_eq!(pool.pick(None).cached, Some(seeded));
+
+        pool.update(&[instance_backend("beta", 8080, 1)]);
+        let after = pool.pick(None);
+        assert_eq!(
+            after.pick,
+            Some(PoolPick::Instance {
+                instance: "beta".to_owned(),
+                port: 8080,
+            })
+        );
+        assert_eq!(after.cached, None, "the removed instance's cache must not leak");
     }
 
     // ----- health probing + resolution cache -----
