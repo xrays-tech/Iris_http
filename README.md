@@ -172,7 +172,7 @@ tests/
   stubs/upstream.py  # 可配置 HTTP 上游桩
 ```
 
-**验证证据（HEAD `1480aba`，2026-10-18）**：`cargo build` 0 warnings；`cargo test` 360 passed / 0 failed（lib 254、bin 7、config_load 71、firewall 11、openstack 17）；`scripts/e2e/` 8/8 通过（含新增 `12-forward-instance.sh`）；生产代码零 `unwrap/expect/panic`。
+**验证证据（HEAD `bc7dcd4`，2026-10-18）**：`cargo build` 0 warnings；`cargo test` 360 passed / 0 failed（lib 254、bin 7、config_load 71、firewall 11、openstack 17）；`scripts/e2e/` 8/8 通过（含新增 `12-forward-instance.sh`）；生产代码零 `unwrap/expect/panic`。
 
 ## Acknowledgements
 
