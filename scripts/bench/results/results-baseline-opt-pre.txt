@@ -1,0 +1,5 @@
+Iris HTTP P15 perf baseline (tag=opt-pre, oha JSON, M4 loopback)
+S1 static RR     rps  28960  p50  1.37ms p90  3.52ms p99  6.38ms succ 100.00%
+S2 static RR     rps  27679  p50  3.92ms p90 10.65ms p99 19.58ms succ 100.00%
+S3 ketama-inst   rps  29943  p50  1.29ms p90  3.41ms p99  6.06ms succ 100.00%
+S4 ketama-inst   rps  27042  p50  4.09ms p90 11.15ms p99 20.68ms succ 100.00%

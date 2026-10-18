@@ -1,0 +1,8 @@
+== mock on :50697 (pid 8003) ==
+== iris up (pid 8015), warming resolvers ==
+== scenarios (S1..S4) ==
+S1-static-rr     c=50   rps=29747.896210125236 p50=0.001285708 p90=0.003425083 p99=0.006045208 succ=1.0    
+S2-static-rr     c=200  rps=27704.175543432917 p50=0.003565125 p90=0.009614459 p99=0.017611417 succ=1.0    
+S3-ketama-inst   c=50   rps=30081.331419255872 p50=0.001331541 p90=0.003395791 p99=0.005899542 succ=1.0    
+S4-ketama-inst   c=200  rps=27116.333438950467 p50=0.003776208 p90=0.010309708 p99=0.019248875 succ=1.0    
+== done; full oha outputs under /tmp/iris-bench-opt-after-*; summary: /tmp/iris-bench-p15/results-opt-after.txt ==
