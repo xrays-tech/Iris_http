@@ -6,7 +6,7 @@
 
 ## 1. 职责与不变量
 
-- 输入：`instance_name`（来自 Host 解析）+ `port`（已通过 ACL，见 `firewall.md`）。
+- 输入：`instance` 标识（名称或 UUID）+ `port`。来源有二：openstack 通配站点由 Host `{instance}-{port}.base_domain` 解析得出（`port` 已通过 ACL，见 `firewall.md`）；forward 站点由后端条目 `instance` + 显式 `port` 给出（无 ACL 门禁）。
 - 输出：上游 `{ip}:{port}`，其中 IP 为 floating（优先）或 fixed。
 - 不变量：
   1. 同一实例并发查询**只穿透一次** OpenStack（单飞）。
@@ -61,12 +61,16 @@ resolve(instance_name):
 
 | 场景 | 方法/路径 | 查询参数 | 判定 |
 |---|---|---|---|
-| 按 UUID（已知实例 ID，预留） | `GET /servers/{uuid}` | — | 200 → 单实例 |
-| 按名称（本版本主路径） | `GET /servers` | `name={instance_name}&all_tenants=true` | 200 → 列表内做**精确名称匹配**（`exact_name_match`，name 字段逐字节相等） |
+| 按 UUID（identifier 形如 `8-4-4-4-12`） | `GET /servers/{uuid}` | — | 200 → 单实例信封 `{"server":{...}}`；404 → 不存在 |
+| 按名称（其余情况） | `GET /servers` | `name={instance_name}&all_tenants=true` | 200 → 列表内做**精确名称匹配**（`exact_name_match`，name 字段逐字节相等） |
 
+**UUID 优先级规则（重要）**：只要 identifier 是 `8-4-4-4-12` 十六进制字符串（大小写不敏感，长度与分隔符严格），就**一律**走 `GET /servers/{uuid}` show-by-id——`is_instance_uuid` 在 `query` 分发前判别。
+
+- 推论：一个**真实名称为 UUID 形态**的实例**无法按名称解析**；同一标识总被当作 UUID。这是刻意的确定性规则，避免"同名 UUID 字符串"歧义。
+- 名称路径的具体过程：`query_servers` 取回列表 → `exact_name_match` 逐字节相等；列表为空或名字不等价于 404（实例不存在）→ 负缓存。
+- 两条路径复用同一套标准头、状态映射（401/403/404/其它非 2xx）与 401 单次刷新重试。
 - 必需头：`X-Auth-Token: {token}`、`Accept: application/json`、`OpenStack-API-Version: compute 2.1`（与 Iris_ssh mock 契约一致）。
-- `all_tenants=true` 配合 admin/有权限的认证主体，实现"全局查找实例"（propose 要求）。若认证主体无跨项目权限，Nova 可能返回 403 → 记录清晰错误事件，按"发现服务错误"处理（§7）。
-- 名称精确匹配失败（列表为空或名字不相等）→ 等价于 404（实例不存在）→ 负缓存。
+- `all_tenants=true` 配合 admin/有权限的认证主体，实现"全局查找实例"（propose 要求）。若认证主体无跨项目权限，Nova 可能返回 403 → 记录清晰错误事件，按"发现服务错误"处理（§7）。show-by-id 路径不带 `all_tenants`。
 
 ## 5. 地址选择（floating / fixed）
 
@@ -125,6 +129,13 @@ Nova 响应结构（`server.addresses`）：
 
 - 全部共享状态（缓存、token、last-known-good、熔断器）置于 `Arc<...>` 内；写路径加锁，读路径尽可能无锁/`ArcSwap`。
 - Nova 客户端用 `reqwest` 连接池（或 Pingora 自带 HTTP client `pingora::http::Client`，避免在代理主线程外引入独立运行时）；`discovery` 的 async 调用在 `upstream_peer` 之前完成于 `request_filter` 阶段，避免阻塞连接池回收语义——详见 §8 时序。
+
+### 6.6 环境共享（resolver / 缓存按环境键）
+
+- 解析器**每环境一个**，键为环境名（`<config-dir>/openstack/<env-name>.yaml` 的文件 stem）；`build_env_resolvers(config)` 为一个 `OpenStackEnv` 建一个 `Arc<dyn Resolver>`。
+- 同一环境的所有消费者共享同一 resolver 实例，因而共享同一份**缓存 / 单飞 / 熔断 / last-known-good**；例如一个 openstack 通配站点与一个 forward instance 池引用同一 `prod` 环境时，对同名实例只穿透一次 Nova。
+- 全部环境的 resolver 共用一个 `HttpClient`，Keystone/Nova 连接跨环境池化（`discovery.md` §6.5 的连接池语义）。
+- reload 时仅当该环境的 `OpenStackConfig` 相等才复用同一 `Arc<dyn Resolver>`（缓存保留）；否则重建，见 `reload.md` §3。
 
 ## 7. 错误语义（对外 HTTP 状态）
 

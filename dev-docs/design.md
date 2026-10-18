@@ -107,18 +107,24 @@
 
 ### 4.5 负载均衡（`lb.rs`，仅 forward 站点）
 
-- 每 forward 站点一个 `LoadBalancer`（`pingora-load-balancing`）。
-- 后端建模：`Backend::new(addr)`；启用权重时用 `Backend::Weighted(weight)`（`BackendWeight`），与 `Algorithm` 配合：
-  - `round_robin` → `Algorithm::RoundRobin`（等权轮询）
-  - `weighted_round_robin` → `Algorithm::RoundRobin`（Pingora 的 RoundRobin 对 Weighted 后端即加权轮询）
-  - `random` → `Algorithm::Random`
-  - `ketama` → `Algorithm::Ketama`（按客户端一致性哈希，实现会话亲和；hash 键取客户端 IP）
-- 后端集合热更新用 `lb.update(backends)`（原子替换 selector，不打断在途请求）。
-- 健康检查：每站点一个后台任务 `TcpHealthCheck`（或 `HttpHealthCheck`），周期 `update_frequency` 调 `lb.update()` 剔除/恢复故障后端；故障后端不参与选择，恢复后自动回归。
+每 forward 站点一个池，按后端形态分两种（`ForwardBackends`）：
 
-### 4.6 OpenStack 解析器（`openstack/`，仅 openstack 站点）
+- **`Static(Arc<LbEngine>)`**——全部后端为字面 `addr`：包裹 Pingora `LoadBalancer`，按类型参数选择算法（`LbMode` → 泛型 `BackendSelection`）：
+  - `round_robin` / `weighted_round_robin` → `RoundRobin`（Pingora 对加权后端即加权轮询）
+  - `random` → `Random`
+  - `ketama` → `Consistent`（按客户端一致性哈希，实现会话亲和；hash 键取客户端 IP）
+  - 后端集合热更新用 MutableDiscovery 原地换表 + `LoadBalancer::update()`（原子替换 selector，不打断在途请求，且保留共享 registry 中已观察到的健康状态）。
+- **`Instance(Arc<InstancePool>)`**——任一后端为 `instance`：条目为站点启用的后端（`weight>0`）；`addr` 条目直接拨号，`instance` 条目经站点 `openstack_env` 对应的**共享 resolver** 解析（floating 优先 / fixed 回退）后再拨号。选择只考虑**健康**条目；ketama 键取**实例身份**（名称/UUID），不用解析出的 IP。
 
-详见 `discovery.md`。职责：token 获取与缓存、Nova 查询、`{instance} → {floating_ip, fixed_ip}` 解析、TTL 缓存（正向 1 天）、负缓存、单飞、熔断、fail-open（last-known-good）。
+  数据流：`upstream_peer` 命中 site → 池选出 `PoolPick`（`Static(addr)` 或 `Instance{instance,port}`）→ `Static` 直接构造 `HttpPeer`；`Instance` 先用池内最近解析（探针缓存）的地址，无缓存则现场 `resolve`；解析失败（NotFound/NoAddress/AuthFailed/DiscoveryUnavailable）→ 502。`fail_to_connect` 对同一 `PoolPick` **回退 fixed 重试一次**（绝不重新选择、换实例）。
+
+- 健康检查：全进程一个共享 `HealthRegistry`，由**单个** `HealthCheckService` 驱动，`ProbeRegistry` 作为唯一探针按后端分派到站点级 probe（TCP/HTTP、路径、超时）并各自遵守 `interval_secs`。`Static` 池的后端经该共享注册表门控；`Instance` 池由独立的 `instance_health_service` 探测（`ProbeRegistry::sync` 跳过含 instance 后端的站点，避免双重探测/健康分叉）：先解析（走环境 resolver 缓存）再对解析地址探活，失败标记不健康。站点未配置 `health_check` 时其启用项始终可选，故障在请求时以 502 暴露。后端增删经共享 registry 自动生效（无需重挂探针）。
+
+### 4.6 OpenStack 解析器（`openstack/`）
+
+详见 `discovery.md`。职责：token 获取与缓存、Nova 查询（按 UUID show-by-id / 按名称精确匹配）、`{instance} → {floating_ip, fixed_ip}` 解析、TTL 缓存（正向 1 天）、负缓存、单飞、熔断、fail-open（last-known-good）。
+
+**每环境一个 resolver**（键 = 环境名）：`build_env_resolvers(config)` 为一个 `OpenStackEnv` 构造一个 `Arc<dyn Resolver>`，所有引用该环境的消费者（openstack 通配站点 + forward instance 池）共享同一实例，从而共享同一份缓存/单飞/熔断/last-known-good；所有 resolver 共用一个 `HttpClient`（Keystone/Nova 连接池化）。站点不再各自持有解析器。
 
 ### 4.7 防火墙判定（`firewall.rs`）
 
@@ -126,7 +132,7 @@
 
 ### 4.8 配置监视/重载服务（`reload.rs`）
 
-详见 `reload.md`。后台服务监听 SIGHUP 与配置目录变化，重新解析并原子切换配置快照。
+详见 `reload.md`。后台服务监听 SIGHUP 与配置目录变化，重新解析（站点 + 环境文件）并原子切换配置快照。复用策略：forward 站点池按四元（`backends`/`lb_mode`/`health_check`/`openstack_env`）比较，环境 resolver 按 `OpenStackConfig` 相等比较（键 = 环境名）；未变者复用同一 `Arc`，保留池内解析缓存、已观察健康与 resolver 缓存。配置指纹按环境名排序逐环境哈希（含凭据真实值），仅凭据轮换也会被感知。
 
 ## 5. 请求生命周期（openstack 站点，最复杂路径）
 
@@ -146,22 +152,23 @@ iris-http/
 ├─ Cargo.toml
 ├─ config/                    # 运行时配置目录（--config-dir，默认 /etc/iris 或 ./config）
 │  ├─ sites/*.yaml            # 每站点一个文件（forward / openstack）
+│  ├─ openstack/*.yaml        # 每环境一个文件（文件 stem = 环境名，被站点按名引用）
 │  └─ firewall/*.role         # 每个实例一个规则文件（由 openstack 站点引用其目录）
 └─ src/
    ├─ main.rs                 # Server 装配、信号、CLI（iris reload 等）
    ├─ config/
-   │  ├─ mod.rs               # Config / SiteConfig 解析、目录加载、校验（纯函数）
-   │  ├─ forward.rs           # forward 站点解析与校验
-   │  ├─ openstack.rs         # openstack 站点解析与校验（含 secret 展开 ${ENV}）
-   │  └─ firewall.rs          # role 文件解析与校验
+   │  ├─ mod.rs               # Config 解析、目录加载（sites + openstack envs）、全局校验（纯函数）
+   │  ├─ forward.rs           # forward 站点解析与校验（BackendTarget addr/instance）
+   │  ├─ openstack.rs         # openstack 站点 + 独立环境文件解析与校验（含 secret 展开 ${ENV}）
+   │  └─ (firewall 见 src/firewall.rs)
    ├─ routing.rs              # RoutingTable、域名匹配
    ├─ proxy.rs                # ProxyHttp 实现
    ├─ tls.rs                  # TlsAccept 回调（SNI→证书）
-   ├─ lb.rs                   # forward 站点 LoadBalancer 构建 + 健康检查任务
+   ├─ lb.rs                   # forward 站点池（Static LoadBalancer / Instance 池）+ 共享健康注册表与探针
    ├─ openstack/
-   │  ├─ mod.rs               # 解析器组合（缓存、单飞、熔断、fail-open）
+   │  ├─ mod.rs               # 解析器组合（缓存、单飞、熔断、fail-open）+ build_env_resolvers（键=环境名）
    │  ├─ auth.rs              # Keystone v3 认证 + token 缓存/刷新
-   │  ├─ nova.rs              # Nova 查询 + 响应解码 + 地址选择
+   │  ├─ nova.rs              # Nova 查询（名称列表 / UUID show-by-id）+ 响应解码 + 地址选择
    │  └─ cache.rs             # 缓存、单飞、熔断、last-known-good
    ├─ firewall.rs             # ACL 判定（端口 + CIDR 匹配）
    ├─ reload.rs               # 重载后台服务

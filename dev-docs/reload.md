@@ -19,14 +19,14 @@
 后台服务（或 SIGHUP 处理）执行：
 
 ```
-1. load_config(sites_dir)                      // config.md §6：解析 + 全量校验（纯函数）
+1. load_config(sites_dir, envs_dir)            // config.md §6：解析站点 + 环境文件，全量校验（纯函数）
 2. 失败? → 打日志 + 指标 config_reload_total{ok=false}；保持旧配置继续服务，进程不退出
    成功? ↓
 3. 构建一代新 Snapshot（config、路由表、LB 引用、证书表、firewall 表、resolver 表、指纹）；
-   共享 HealthRegistry 沿用旧值，不重建
+   共享 HealthRegistry 沿用旧值，不重建；未变的 forward 池与环境 resolver 复用旧 Arc
 4. 全部构建成功后：
    snapshot.store(Arc::new(new Snapshot))      // 唯一原子切换点（config+routing+certs+firewall+lbs+resolvers 一次发布）
-5. 重算配置指纹（hash）供 /version 与告警对比（覆盖凭据真实值，凭据轮换也能被感知）
+5. 重算配置指纹（hash）供 /version 与告警对比（按环境名排序逐环境哈希，覆盖凭据真实值，凭据轮换也能被感知）
 6. 指标 config_reload_total{ok=true}
 ```
 
@@ -37,20 +37,24 @@
 
 | 变更 | 生效点 | 机制 |
 |---|---|---|
-| forward 后端增删/权重变化 | 对应站点 `LoadBalancer` | 池相关配置未变则复用同一 `Arc<LbEngine>`；变了则重建，但都共享同一 `HealthRegistry`：`lb.update(backends)` 原子替换 selector，观察到的健康状态沿用 |
-| 负载均衡算法变化 | 对应站点 LB | 用共享 registry 重建 `LoadBalancer`，随快照发布（算法变化会换引擎，但探针与健康状态仍在共享表内） |
+| forward 后端增删/权重变化 | 对应站点池 `ForwardBackends` | **四元比较**（`backends`/`lb_mode`/`health_check`/`openstack_env`）未变则复用同一 `Arc<ForwardBackends>`；变了则经 `build_forward_backends` 重建。`Static` 池共享同一 `HealthRegistry`（观察到的健康沿用）；`Instance` 池复用即保留解析缓存与最近解析 |
+| 负载均衡算法变化 | 对应站点池 | 算法在四元内 → 触发重建（换引擎），随快照发布；`Static` 探针与已观察健康仍在共享表内 |
+| forward `openstack_env` 变化 | 对应站点池 | 在四元内 → **必须重建**（同一实例改由另一环境解析），旧解析缓存不跨环境沿用 |
 | 站点新增/删除/域名变化 | 路由表 | 随单一快照发布；新请求即见新表 |
-| openstack 站点参数（auth/api 等） | 站点解析器 | 未变则复用同一 `Arc<dyn Resolver>`；**进程内缓存保留**（同实例 key 继续命中，避免重载打冲击穿）。变了则重建 |
+| openstack 环境参数（auth/api/cache_ttl/timeout 等） | 环境 resolver（键=环境名） | 新旧该环境的 `OpenStackConfig` 相等则复用同一 `Arc<dyn Resolver>`；**进程内缓存保留**（同实例 key 继续命中，避免重载打冲击穿）。不等则重建。**一个环境重建，所有引用它的站点（openstack 站点 + forward instance 池）同时改用新 resolver** |
 | `firewall_dir`/role 文件变化 | 防火墙表 | 重载时重读全部 `.role`；随快照发布 |
 | 证书/密钥变化 | SNI 回调 | `SniCertSource` 读取与代理/reload **同一个** `ArcSwap<Snapshot>` 的 `certs`；新握手即用新证书，旧握手不受影响（FIX #1） |
 | 健康检查规格/间隔变化 | 共享探针 | `ProbeRegistry.sync(&config)` 按新配置重指向站点级 probe 并重置其 interval 计时；恢复/剔除在下次探测生效（FIX #2） |
 | forward 站点被移除 | 共享探针 + 共享 registry | `ProbeRegistry.sync` 不再为其建表；引擎被释放时其 `Backends` view 移除，registry 注销其后端（FIX #8） |
-| `cache_ttl_secs` 等 | 缓存参数 | 解析器重建时对新缓存条目生效；存量条目照旧 TTL |
+| `cache_ttl_secs` 等（环境文件） | 环境 resolver | 该环境 `OpenStackConfig` 变更 → resolver 重建，新缓存参数对新条目生效；存量条目照旧 TTL |
+| 环境文件新增/删除 | 环境 resolver 表 | 新增 → 建 resolver；删除 → 其引用站点/池在校验阶段即失败（`openstack_env` 不存在），整份重载被拒 |
 
 实现要点：
 - `certificate_callback(&self)` 只读 `&self`（Trait 签名）；证书表不再有独立 store，回调读取与代理共享的 `Snapshot.certs`（FIX #1）。
 - 共享 `HealthRegistry` 由启动时注册的**单个** `HealthCheckService` 驱动；`ProbeRegistry` 是注册表唯一的探针，按后端分派到站点级 probe 并各自遵守 `interval_secs`。新增/变更站点的引擎自动向该共享 registry 贡献后端，无需重挂探针（FIX #2）。
 - 加载列表外的站点（reload 移除的 forward 站点）不再被探测；其引擎的 view 随最后一个 `Arc<LbEngine>` 释放而注销（FIX #8）。
+- `Instance` 池由独立的 `instance_health_service` 探测（`ProbeRegistry.sync` 跳过含 instance 后端的站点），其探针循环读的是当前快照；池被复用/重建都随快照原子可见。
+- 指纹按**环境名排序**逐个哈希（`{config:?}` 已把 `openstack_envs` 屏蔽为数量），因此环境的 HashMap 插入序不影响指纹；仅凭据轮换也会改变指纹（FIX #4 的扩展）。
 
 ## 4. 并发与一致性
 
@@ -81,7 +85,7 @@
 
 ## 7. 测试策略（reload 专项）
 
-- 单元：重载流程状态机（成功切换/校验失败保持旧配置）、配置指纹计算（含仅凭据轮换变化，FIX #4）、幂等重载、单一快照原子性、共享 registry 注册（FIX #2）。
+- 单元：重载流程状态机（成功切换/校验失败保持旧配置）、配置指纹计算（含仅凭据轮换变化与按环境名排序确定性，FIX #4）、幂等重载、单一快照原子性、共享 registry 注册（FIX #2）、forward 池四元复用（未变复用 / `openstack_env` 变化重建）、环境 resolver 按名键复用（未变复用 / 环境配置变化重建）。
 - 集成（组合 mock Nova + 双后端模拟上游）：
   1. 重载新增站点 → 新 Host 立即路由成功；旧站点在途 WebSocket 连接不断。
   2. 重载后端集合 → `lb.update` 生效；在途请求不 5xx。
@@ -89,4 +93,5 @@
   4. 坏配置重载 → 返回错误日志，进程继续服务旧配置。
   5. `kill -HUP` 后 `/version` 的 config_hash 变化。
   6. 重载新增带健康检查的站点 → 其后端立即被共享探针门控（不健康后端永不被选中）；重载改健康检查间隔 → 重新探测。E2E：`scripts/e2e/11-health-reload-new-site.sh`（FIX #2）；`scripts/e2e/09-health-reload.sh`（不变站点引擎复用，健康状态跨重载保留）。
+  7. 重载 swap forward instance 后端集 → 被移除的实例后端不再被选中。E2E：`scripts/e2e/12-forward-instance.sh`（P14-C3）。
 - 全部走 `cargo build` + `cargo test` + `scripts/e2e/*.sh` 闭环。

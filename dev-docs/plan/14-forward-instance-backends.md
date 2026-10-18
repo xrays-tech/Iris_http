@@ -208,3 +208,7 @@ C1→C2→C3 串行（C2/C3 都依赖 C1 类型；C2/C3 均触碰 state/reload/p
 - 测试专用 seam（均在 `#[cfg(test)]`）：`ForwardBackends::select_static`、`InstancePool::seed_resolution`；契约未列，仅测试可见。
 - `state.rs` 引入 bootstrap `ArcSwap<Snapshot>` 句柄使 `InstancePool` 能捕获快照（`Snapshot.lbs` 与池对 snapshot 的引用形成装配顺序问题）；对外契约（`SharedState::handle`/`lb`/`resolver_for`）不变。
 - 未触碰 `02-contracts.md`（未发现契约缺陷）。
+
+## C4 收尾 — 阶段记录
+
+状态：**完成**（commit `P14-C4: docs — env files, instance backends, UUID rule, evidence update`）。仅改文档，无代码变更：`dev-docs/{config,design,discovery,reload,README}.md`、根 `README.md`、本文件按落在磁盘上的 schema（`Config.openstack_envs`、`OpenStackSite.openstack_env`、`BackendTarget::{Addr,Instance}`、`is_instance_uuid` 优先规则、四元池复用/环境键 resolver 复用/按环境名排序指纹）与已提交 fixtures（`tests/fixtures/{sites,openstack,e2e-p7}`）逐条核对更新；验证证据刷新为 HEAD `1480aba`：`cargo test` **360 passed**（lib 254、bin 7、config_load 71、firewall 11、openstack 17）、e2e **8/8 通过**（含 `12-forward-instance.sh`）。
