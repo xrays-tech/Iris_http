@@ -31,7 +31,7 @@ use pingora_prometheus::prometheus::{register_int_counter_vec, IntCounterVec};
 
 use crate::config::{load_config, Config};
 use crate::firewall::{build_firewall, FirewallTable};
-use crate::lb::{build_lb, LbEngine};
+use crate::lb::{build_forward_backends, ForwardBackends};
 use crate::openstack::{HttpClient, OpenStackResolver, Resolver};
 use crate::routing::RoutingTable;
 use crate::state::{SharedState, Snapshot};
@@ -161,59 +161,56 @@ pub fn apply_new_config(state: &SharedState, cfg: Config) -> Result<(), ReloadEr
     // the shared health registry forward. Held for the whole build phase.
     let old = state.snapshot();
 
-    // Forward load balancers: reuse the live engine for a forward site whose
-    // *pool-relevant* configuration (backends, algorithm, health check) is
-    // unchanged. The engine shares the process-wide health registry, so even a
-    // rebuilt engine is gated by the already-running probe; reuse additionally
-    // keeps the observed health history across the reload.
-    let mut lbs: HashMap<String, Arc<LbEngine>> = HashMap::with_capacity(cfg.forward.len());
+    // Forward backend pools: reuse the live pool for a forward site whose
+    // *pool-relevant* configuration is unchanged. The four-way comparison is
+    // backends / algorithm / health check / openstack_env: an environment
+    // change must rebuild the pool (it resolves through a different env).
+    // Reuse keeps the observed health and the cached resolutions; a Static
+    // engine also keeps its shared-registry probe, and a rebuilt engine is still
+    // gated by the already-running probe.
+    let snapshot_handle = state.handle();
+    let mut lbs: HashMap<String, Arc<ForwardBackends>> = HashMap::with_capacity(cfg.forward.len());
     for site in &cfg.forward {
         let unchanged = old.config.forward.iter().any(|old_site| {
             old_site.name == site.name
                 && old_site.backends == site.backends
                 && old_site.lb_mode == site.lb_mode
                 && old_site.health_check == site.health_check
+                && old_site.openstack_env == site.openstack_env
         });
-        let engine = if unchanged {
+        let pool = if unchanged {
             match old.lbs.get(&site.name) {
                 Some(existing) => Arc::clone(existing),
-                None => build_lb(&site.backends, &site.lb_mode, &old.registry),
+                None => build_forward_backends(site, &old.registry, Arc::clone(&snapshot_handle)),
             }
         } else {
-            build_lb(&site.backends, &site.lb_mode, &old.registry)
+            build_forward_backends(site, &old.registry, Arc::clone(&snapshot_handle))
         };
-        lbs.insert(site.name.clone(), engine);
+        lbs.insert(site.name.clone(), pool);
     }
 
-    // Resolvers: reuse the live resolver for an openstack site whose
-    // environment's control-plane configuration is byte-for-byte unchanged.
+    // Resolvers: one per OpenStack environment, keyed by env name. Reuse the
+    // live resolver when the environment's control-plane configuration is
+    // unchanged, so its cache/breaker/last-known-good survive the reload.
     let client = Arc::new(HttpClient::new());
     let mut resolvers: HashMap<String, Arc<dyn Resolver>> =
-        HashMap::with_capacity(cfg.openstack.len());
-    for site in &cfg.openstack {
-        // The environment reference is validated at load time; a hand-built
-        // `Config` without the environment simply has no resolver for the site.
-        let Some(env) = cfg.openstack_envs.get(&site.openstack_env) else {
-            continue;
-        };
-        let unchanged = old.config.openstack.iter().any(|old_site| {
-            old_site.name == site.name
-                && old
-                    .config
-                    .openstack_envs
-                    .get(&old_site.openstack_env)
-                    .map(|old_env| old_env.config())
-                    == Some(env.config())
-        });
+        HashMap::with_capacity(cfg.openstack_envs.len());
+    for (env_name, env) in &cfg.openstack_envs {
+        let unchanged = old
+            .config
+            .openstack_envs
+            .get(env_name)
+            .map(|old_env| old_env.config())
+            == Some(env.config());
         let resolver: Arc<dyn Resolver> = if unchanged {
-            match old.resolvers.get(&site.name) {
+            match old.resolvers.get(env_name) {
                 Some(existing) => Arc::clone(existing),
                 None => Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client))),
             }
         } else {
             Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client)))
         };
-        resolvers.insert(site.name.clone(), resolver);
+        resolvers.insert(env_name.clone(), resolver);
     }
 
     // Re-point the shared probe at the new site/health specs. Targets of removed
@@ -690,12 +687,12 @@ mod tests {
         // lbs map rebuilt and selects the new backend
         assert!(state.lb("api").is_some());
         assert_eq!(
-            state.lb("www").expect("www lb").select(None),
+            state.lb("www").expect("www lb").select_static(None),
             Some(SocketAddr::from(([127, 0, 0, 1], 18082)))
         );
 
         // resolvers map rebuilt for the changed openstack site
-        assert!(state.resolver_for("rent").is_some());
+        assert!(state.resolver_for("prod").is_some());
     }
 
     #[test]
@@ -703,12 +700,12 @@ mod tests {
         let state = own_state(config_a());
         apply_new_config(&state, config_b()).expect("first apply");
         let fp = state.fingerprint();
-        let weighted = state.lb("www").expect("www lb").select(None);
+        let weighted = state.lb("www").expect("www lb").select_static(None);
 
         apply_new_config(&state, config_b()).expect("second apply");
         assert_eq!(state.fingerprint().as_str(), fp.as_str());
         assert_eq!(
-            state.lb("www").expect("www lb").select(None),
+            state.lb("www").expect("www lb").select_static(None),
             weighted,
             "re-applying the same config keeps the same pool"
         );
@@ -752,7 +749,7 @@ mod tests {
 
         // Sanity: the old pool still answers.
         assert_eq!(
-            state.lb("www").expect("www lb").select(None),
+            state.lb("www").expect("www lb").select_static(None),
             Some(SocketAddr::from(([127, 0, 0, 1], 18081)))
         );
     }
@@ -777,14 +774,14 @@ mod tests {
     #[test]
     fn resolver_is_reused_when_openstack_config_is_unchanged() {
         let state = own_state(config_a());
-        let existing = state.resolver_for("rent").expect("resolver present");
+        let existing = state.resolver_for("prod").expect("resolver present");
 
         // Same openstack config, different forward lane.
         let mut same_openstack = config_a();
         same_openstack.forward.push(forward_site("api", "api.example.com", 18083));
         apply_new_config(&state, same_openstack).expect("apply");
 
-        let after = state.resolver_for("rent").expect("resolver present");
+        let after = state.resolver_for("prod").expect("resolver present");
         assert!(
             Arc::ptr_eq(&existing, &after),
             "an unchanged openstack site must keep its resolver (cache retained)"
@@ -794,7 +791,7 @@ mod tests {
     #[test]
     fn resolver_is_rebuilt_when_openstack_config_changes() {
         let state = own_state(config_a());
-        let existing = state.resolver_for("rent").expect("resolver present");
+        let existing = state.resolver_for("prod").expect("resolver present");
 
         // Changes cache_ttl_secs of the environment -> the config differs.
         let mut changed = config_a();
@@ -803,7 +800,7 @@ mod tests {
             .cache_ttl_secs = 43_200;
         apply_new_config(&state, changed).expect("apply");
 
-        let after = state.resolver_for("rent").expect("resolver present");
+        let after = state.resolver_for("prod").expect("resolver present");
         assert!(
             !Arc::ptr_eq(&existing, &after),
             "a changed openstack site must rebuild its resolver"
@@ -849,7 +846,7 @@ mod tests {
             "a changed backend set must rebuild the engine"
         );
         assert_eq!(
-            after.select(None),
+            after.select_static(None),
             Some(SocketAddr::from(([127, 0, 0, 1], 18099)))
         );
     }
@@ -881,6 +878,102 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&before, &state.lb("www").expect("www lb")),
             "a changed health check must rebuild the engine"
+        );
+    }
+
+    // ----- C3: forward pool reuse (four-way) + env-keyed resolvers -----
+
+    fn two_envs() -> HashMap<String, Arc<OpenStackEnv>> {
+        let mut map = openstack_envs(86_400);
+        map.insert(
+            "dev".to_owned(),
+            Arc::new(OpenStackEnv {
+                name: "dev".to_owned(),
+                config: env_config(3_600),
+            }),
+        );
+        map
+    }
+
+    fn instance_forward_site(env: &str) -> ForwardSite {
+        let mut site = forward_site("apps", "apps.example.com", 18080);
+        site.openstack_env = Some(env.to_owned());
+        site.backends = vec![Backend {
+            target: BackendTarget::Instance {
+                instance: "INS001".to_owned(),
+                port: 8080,
+            },
+            weight: 1,
+        }];
+        site
+    }
+
+    fn config_with_instance_site(env: &str) -> Config {
+        Config {
+            forward: vec![instance_forward_site(env)],
+            openstack: Vec::new(),
+            openstack_envs: two_envs(),
+        }
+    }
+
+    #[test]
+    fn unchanged_instance_site_reuses_its_pool() {
+        let state = own_state(config_with_instance_site("prod"));
+        let before = state.lb("apps").expect("instance pool");
+
+        // Only an unrelated forward site is added; the instance site's
+        // four-tuple (backends/lb_mode/health/openstack_env) is unchanged.
+        let mut next = config_with_instance_site("prod");
+        next.forward
+            .push(forward_site("extra", "extra.example.com", 18090));
+        apply_new_config(&state, next).expect("apply");
+
+        let after = state.lb("apps").expect("instance pool");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged instance site must reuse its pool (health + cached resolutions)"
+        );
+    }
+
+    #[test]
+    fn changed_openstack_env_rebuilds_the_instance_pool() {
+        let state = own_state(config_with_instance_site("prod"));
+        let before = state.lb("apps").expect("instance pool");
+
+        apply_new_config(&state, config_with_instance_site("dev")).expect("apply");
+
+        let after = state.lb("apps").expect("instance pool");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "an openstack_env change must rebuild the pool"
+        );
+    }
+
+    #[test]
+    fn resolvers_are_keyed_by_environment_name() {
+        let state = own_state(config_a());
+        assert!(state.resolver_for("prod").is_some());
+        assert!(
+            state.resolver_for("rent").is_none(),
+            "resolvers must be keyed by env name, not site name"
+        );
+    }
+
+    #[test]
+    fn unchanged_environment_reuses_its_resolver_across_reload() {
+        let state = own_state(config_a());
+        let before = state.resolver_for("prod").expect("prod resolver");
+
+        // A forward-only change leaves the environment untouched.
+        let mut next = config_a();
+        next.forward
+            .push(forward_site("api", "api.example.com", 18091));
+        apply_new_config(&state, next).expect("apply");
+
+        let after = state.resolver_for("prod").expect("prod resolver");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an unchanged environment must reuse its resolver (cache retained)"
         );
     }
 
@@ -983,7 +1076,7 @@ mod tests {
         assert!(service.reload_once(true), "a changed config reloads");
         assert_ne!(service.state.fingerprint().as_str(), before.as_str());
         assert_eq!(
-            service.state.lb("www").expect("www lb").select(None),
+            service.state.lb("www").expect("www lb").select_static(None),
             Some(SocketAddr::from(([127, 0, 0, 1], 18082)))
         );
     }
@@ -1006,7 +1099,7 @@ mod tests {
             "the fingerprint must be unchanged after a rejected reload"
         );
         assert_eq!(
-            service.state.lb("www").expect("www lb").select(None),
+            service.state.lb("www").expect("www lb").select_static(None),
             Some(SocketAddr::from(([127, 0, 0, 1], 18081)))
         );
     }

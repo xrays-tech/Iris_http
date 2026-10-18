@@ -22,7 +22,7 @@ use pingora::services::background::background_service;
 use pingora_prometheus::prometheus::{gather, Encoder, TextEncoder};
 
 use iris_http::config::load_config;
-use iris_http::lb::health_check_service;
+use iris_http::lb::{health_check_service, instance_health_service};
 use iris_http::logging;
 use iris_http::proxy::IrisProxy;
 use iris_http::reload::{init_metrics, ReloadService};
@@ -314,15 +314,21 @@ impl ProxyHttp for VersionMetricsProxy {
     }
 }
 
-/// Register the single shared forward health-check service (`design.md` §4.5).
+/// Register the shared forward health-check services (`design.md` §4.5, C3).
 ///
-/// One background service covers every forward site through the shared
-/// [`HealthRegistry`](pingora_load_balancing::HealthRegistry), so sites added or
-/// changed by a reload are gated without a per-site service (FIX #2).
+/// Two services cover every forward site: the shared-registry probe gates the
+/// static (`addr`) pools (FIX #2), while the instance health service resolves
+/// and probes the instance pools, which the registry deliberately skips. Both
+/// read the live snapshot, so a site added or changed by a reload is gated with
+/// no per-site service.
 fn register_health_checks(server: &mut Server, shared: &Arc<SharedState>) {
     server.add_service(background_service(
         "health check",
         health_check_service(shared.health_registry()),
+    ));
+    server.add_service(background_service(
+        "instance health check",
+        instance_health_service(shared.handle()),
     ));
 }
 

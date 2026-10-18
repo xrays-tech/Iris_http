@@ -434,28 +434,8 @@ impl Resolver for OpenStackResolver {
     }
 }
 
-/// Build one [`Resolver`] per openstack site, keyed by site name (P7).
-///
-/// All resolvers share a single [`HttpClient`] so Keystone/Nova connections are
-/// pooled across every site. The returned map is the value stored in
-/// [`crate::state::SharedState::resolvers`] and indexed by the routing layer's
-/// `site_idx` → site name.
-pub fn build_resolvers(config: &Config) -> HashMap<String, Arc<dyn Resolver>> {
-    let client = Arc::new(HttpClient::new());
-    config
-        .openstack
-        .iter()
-        .filter_map(|site| {
-            let env = config.openstack_envs.get(&site.openstack_env)?;
-            let resolver: Arc<dyn Resolver> =
-                Arc::new(OpenStackResolver::new(env.config(), Arc::clone(&client)));
-            Some((site.name.clone(), resolver))
-        })
-        .collect()
-}
-
 /// Build one shared [`Resolver`] per OpenStack environment, keyed by
-/// environment name (C2 — the env-keyed successor to [`build_resolvers`]).
+/// environment name (C2/C3).
 ///
 /// Every consumer of an environment (openstack wildcard sites and forward
 /// sites with instance backends) shares the same resolver instance, and thus

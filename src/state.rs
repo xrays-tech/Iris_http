@@ -30,10 +30,10 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use pingora_load_balancing::HealthRegistry;
 
-use crate::config::{Config, ConfigError};
+use crate::config::{Config, ConfigError, ForwardSite};
 use crate::firewall::{build_firewall, FirewallTable};
-use crate::lb::{build_lb, LbEngine, ProbeRegistry};
-use crate::openstack::{build_resolvers, Resolver};
+use crate::lb::{build_forward_backends, ForwardBackends, ProbeRegistry};
+use crate::openstack::{build_env_resolvers, Resolver};
 use crate::routing::RoutingTable;
 use crate::tls::SniCertMap;
 
@@ -47,8 +47,15 @@ pub struct Snapshot {
     pub config: Arc<Config>,
     /// The compiled host-routing table.
     pub routing: Arc<RoutingTable>,
-    /// Forward-site load balancers, keyed by [`crate::config::ForwardSite::name`].
-    pub lbs: Arc<HashMap<String, Arc<LbEngine>>>,
+    /// Forward-site backend pools, keyed by
+    /// [`crate::config::ForwardSite::name`].
+    ///
+    /// Each entry is either the static Pingora engine
+    /// ([`ForwardBackends::Static`]) or the instance-driven [`InstancePool`]
+    /// ([`ForwardBackends::Instance`]) once any backend references an instance.
+    ///
+    /// [`InstancePool`]: crate::lb::InstancePool
+    pub lbs: Arc<HashMap<String, Arc<ForwardBackends>>>,
     /// The per-SNI certificate table served by the TLS listener (P4).
     pub certs: Arc<SniCertMap>,
     /// Per-openstack-site firewall tables, keyed by
@@ -57,14 +64,40 @@ pub struct Snapshot {
     /// A site **without** `firewall_dir` has no entry here, which means "no ACL
     /// checks" for that site (`firewall.md` §4).
     pub firewall: Arc<HashMap<String, Arc<FirewallTable>>>,
-    /// Per-openstack-site instance resolvers, keyed by
-    /// [`crate::config::OpenStackSite::name`] (P7).
+    /// Per-openstack-**environment** instance resolvers, keyed by environment
+    /// name (`Config::openstack_envs` key, C3).
+    ///
+    /// Every consumer of an environment — openstack wildcard sites and forward
+    /// sites with instance backends — shares one resolver, and thus one cache /
+    /// single-flight / breaker / last-known-good state.
     pub resolvers: Arc<HashMap<String, Arc<dyn Resolver>>>,
     /// The process-wide forward health registry, shared by every
     /// [`LbEngine`] (FIX #2). The same object across reloads.
     pub registry: Arc<HealthRegistry>,
     /// Stable content fingerprint of the loaded configuration (P8).
     pub fingerprint: Arc<String>,
+}
+
+/// Build the forward-site backend pool map: [`ForwardBackends::Static`] for an
+/// all-`addr` site, [`ForwardBackends::Instance`] for one with instance
+/// backends.
+///
+/// `handle` is the process-wide snapshot store the instance pools read (for
+/// their env resolver).
+fn build_lbs(
+    sites: &[ForwardSite],
+    registry: &Arc<HealthRegistry>,
+    handle: Arc<ArcSwap<Snapshot>>,
+) -> HashMap<String, Arc<ForwardBackends>> {
+    sites
+        .iter()
+        .map(|site| {
+            (
+                site.name.clone(),
+                build_forward_backends(site, registry, Arc::clone(&handle)),
+            )
+        })
+        .collect()
 }
 
 impl Snapshot {
@@ -138,17 +171,6 @@ impl SharedState {
         registry.set_health_check(Box::new(crate::lb::SharedProbe(Arc::clone(&probes))));
         probes.sync(&config);
 
-        let lbs: HashMap<String, Arc<LbEngine>> = config
-            .forward
-            .iter()
-            .map(|site| {
-                (
-                    site.name.clone(),
-                    build_lb(&site.backends, &site.lb_mode, &registry),
-                )
-            })
-            .collect();
-
         // Build one firewall table per openstack site that configures a
         // `firewall_dir`; a malformed `.role` file fails the whole build. A
         // site without `firewall_dir` is skipped (no ACL checks, one WARN).
@@ -169,21 +191,50 @@ impl SharedState {
             }
         }
 
-        let resolvers = build_resolvers(&config);
+        // One shared resolver per OpenStack environment, so every consumer of
+        // an environment (openstack sites and forward instance backends) shares
+        // its cache/breaker state (C2/C3).
+        let resolvers = build_env_resolvers(&config);
 
-        let snapshot = Snapshot {
-            config: Arc::new(config),
-            routing: Arc::new(routing),
+        let config = Arc::new(config);
+        let routing = Arc::new(routing);
+        let certs = Arc::new(certs);
+        let firewall = Arc::new(firewall);
+        let resolvers = Arc::new(resolvers);
+        let fingerprint = Arc::new(fingerprint);
+
+        // Instance pools read the process snapshot lazily (to reach their env's
+        // resolver), so they need the `ArcSwap` handle before the final
+        // snapshot exists. Publish a bootstrap snapshot first; no reader can
+        // observe it because `SharedState` is not returned until the real
+        // snapshot is stored into the same handle.
+        let handle = Arc::new(ArcSwap::from_pointee(Snapshot {
+            config: Arc::clone(&config),
+            routing: Arc::clone(&routing),
+            lbs: Arc::new(HashMap::new()),
+            certs: Arc::clone(&certs),
+            firewall: Arc::clone(&firewall),
+            resolvers: Arc::clone(&resolvers),
+            registry: Arc::clone(&registry),
+            fingerprint: Arc::clone(&fingerprint),
+        }));
+
+        let lbs = build_lbs(&config.forward, &registry, Arc::clone(&handle));
+
+        // Commit the real snapshot into the same handle the pools captured.
+        handle.store(Arc::new(Snapshot {
+            config,
+            routing,
             lbs: Arc::new(lbs),
-            certs: Arc::new(certs),
-            firewall: Arc::new(firewall),
-            resolvers: Arc::new(resolvers),
+            certs,
+            firewall,
+            resolvers,
             registry,
-            fingerprint: Arc::new(fingerprint),
-        };
+            fingerprint,
+        }));
 
         Ok(Self {
-            snapshot: Arc::new(ArcSwap::from_pointee(snapshot)),
+            snapshot: handle,
             probes,
         })
     }
@@ -224,8 +275,8 @@ impl SharedState {
         Arc::clone(&self.snapshot.load().fingerprint)
     }
 
-    /// Load the load balancer for forward site `name`, if any.
-    pub fn lb(&self, name: &str) -> Option<Arc<LbEngine>> {
+    /// Load the backend pool for forward site `name`, if any.
+    pub fn lb(&self, name: &str) -> Option<Arc<ForwardBackends>> {
         self.snapshot.load().lbs.get(name).cloned()
     }
 
@@ -234,9 +285,9 @@ impl SharedState {
         self.snapshot.load().firewall.get(name).cloned()
     }
 
-    /// Load the resolver for openstack site `name`, if any.
-    pub fn resolver_for(&self, name: &str) -> Option<Arc<dyn Resolver>> {
-        self.snapshot.load().resolvers.get(name).cloned()
+    /// Load the shared resolver for OpenStack environment `env_name`, if any.
+    pub fn resolver_for(&self, env_name: &str) -> Option<Arc<dyn Resolver>> {
+        self.snapshot.load().resolvers.get(env_name).cloned()
     }
 }
 
@@ -405,8 +456,63 @@ mod tests {
             "a site without firewall_dir must not appear in the firewall map"
         );
         assert!(state.firewall_for("rent").is_none());
-        assert!(state.resolver_for("rent").is_some());
+        // Resolvers are keyed by ENVIRONMENT name, not site name (C3).
+        assert!(state.resolver_for("prod").is_some());
+        assert!(state.resolver_for("rent").is_none());
         assert_eq!(state.snapshot().resolvers.len(), 1);
+    }
+
+    #[test]
+    fn openstack_sites_sharing_an_env_share_one_resolver() {
+        let config = Config {
+            forward: Vec::new(),
+            openstack: vec![
+                openstack_site("rent-a", "a.do.top", None),
+                openstack_site("rent-b", "b.do.top", None),
+            ],
+            openstack_envs: envs(),
+        };
+        let state = SharedState::try_new(config).expect("state builds");
+        assert_eq!(
+            state.snapshot().resolvers.len(),
+            1,
+            "one shared resolver per environment"
+        );
+        let a = state.resolver_for("prod").expect("prod resolver");
+        let b = state.resolver_for("prod").expect("prod resolver");
+        assert!(Arc::ptr_eq(&a, &b), "both sites must share the env resolver");
+    }
+
+    #[test]
+    fn addr_only_forward_site_builds_a_static_pool() {
+        let state = state_with(vec![forward_site("www", "www.example.com", LbMode::RoundRobin)]);
+        assert!(matches!(
+            state.lb("www").expect("pool").as_ref(),
+            crate::lb::ForwardBackends::Static(_)
+        ));
+    }
+
+    #[test]
+    fn instance_forward_site_builds_an_instance_pool() {
+        let mut site = forward_site("apps", "apps.example.com", LbMode::RoundRobin);
+        site.openstack_env = Some("prod".to_owned());
+        site.backends = vec![Backend {
+            target: BackendTarget::Instance {
+                instance: "INS001".to_owned(),
+                port: 8080,
+            },
+            weight: 1,
+        }];
+        let config = Config {
+            forward: vec![site],
+            openstack: Vec::new(),
+            openstack_envs: envs(),
+        };
+        let state = SharedState::try_new(config).expect("state builds");
+        assert!(matches!(
+            state.lb("apps").expect("pool").as_ref(),
+            crate::lb::ForwardBackends::Instance(_)
+        ));
     }
 
     #[test]

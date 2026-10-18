@@ -24,6 +24,7 @@ use pingora::upstreams::peer::HttpPeer;
 use pingora::{Error, ErrorType, Result};
 
 use crate::firewall::{AclReason, AclVerdict, FirewallTable};
+use crate::lb::{ForwardBackends, InstancePool, PoolPick};
 use crate::openstack::{ResolveError, ResolvedInstance};
 use crate::routing::{normalize_host, RouteTarget};
 use crate::state::{SharedState, Snapshot};
@@ -73,6 +74,13 @@ pub struct Ctx {
     pub use_fixed: bool,
     /// The configuration snapshot this request is served from (FIX #3).
     pub snapshot: Option<Arc<Snapshot>>,
+    /// The forward-lane pick made for this request (C3).
+    ///
+    /// Set once per request; an instance pick is **pinned** across a retry so
+    /// `fail_to_connect`'s fixed-address fallback retries the *same* instance
+    /// rather than re-selecting a different one. `Ctx` is per-request, so this
+    /// never bleeds across requests.
+    pub pool_pick: Option<PoolPick>,
 }
 
 /// The forward-lane proxy application.
@@ -154,14 +162,115 @@ pub fn decide_route(snapshot: &Snapshot, raw_host: &str) -> RouteDecision {
     }
 }
 
-/// Select an upstream backend for `site` using `client` as the hash key, from
-/// the request's snapshot (FIX #3).
+/// Select an upstream pick for `site` using `client` as the hash key, from the
+/// request's snapshot (FIX #3, C3).
+///
+/// A [`ForwardBackends::Static`] site selects a dial-ready address
+/// ([`PoolPick::Static`]); a [`ForwardBackends::Instance`] site selects an
+/// instance (or a literal address in a mixed pool) to resolve at request time.
 pub fn select_backend(
     snapshot: &Snapshot,
     site: &str,
     client: Option<IpAddr>,
+) -> Option<PoolPick> {
+    match snapshot.lbs.get(site)?.as_ref() {
+        ForwardBackends::Static(lb) => lb.select(client).map(PoolPick::Static),
+        ForwardBackends::Instance(pool) => pool.select(client),
+    }
+}
+
+/// The instance pool for forward site `site`, if it is an instance pool.
+fn instance_pool<'a>(snapshot: &'a Snapshot, site: &str) -> Option<&'a InstancePool> {
+    match snapshot.lbs.get(site).map(Arc::as_ref)? {
+        ForwardBackends::Instance(pool) => Some(pool.as_ref()),
+        ForwardBackends::Static(_) => None,
+    }
+}
+
+/// Resolve `instance` for a forward site through its env's shared resolver.
+///
+/// Returns `None` on any resolution failure (a forward site's backends are an
+/// upstream promise, so every failure becomes a request-time `502`).
+async fn resolve_forward_instance(
+    snapshot: &Snapshot,
+    site: &str,
+    instance: &str,
+) -> Option<ResolvedInstance> {
+    let env_name = snapshot
+        .config
+        .forward
+        .iter()
+        .find(|candidate| candidate.name == site)
+        .and_then(|candidate| candidate.openstack_env.as_deref());
+    let resolver = env_name.and_then(|env| snapshot.resolvers.get(env)).cloned()?;
+    match resolver.resolve(instance).await {
+        Ok(resolved) => Some(resolved),
+        Err(err) => {
+            tracing::warn!(
+                site = %site,
+                instance = %instance,
+                error = %err,
+                "forward instance resolution failed; answering 502"
+            );
+            None
+        }
+    }
+}
+
+/// The resolved floating/fixed addresses for a forward instance pick: the
+/// pool's cached latest resolution, else an on-the-fly resolve (which still
+/// hits the env resolver's cache).
+pub async fn resolve_instance_pick(
+    snapshot: &Snapshot,
+    site: &str,
+    instance: &str,
+) -> Option<ResolvedInstance> {
+    match instance_pool(snapshot, site).and_then(|pool| pool.resolved(instance)) {
+        Some(cached) => Some(cached),
+        None => resolve_forward_instance(snapshot, site, instance).await,
+    }
+}
+
+/// The upstream `{ip}:{port}` for a forward instance pick.
+///
+/// `use_fixed` selects the fixed address for the single fallback retry. Returns
+/// `None` when the instance cannot be resolved or has no usable address.
+pub async fn pick_instance_upstream(
+    snapshot: &Snapshot,
+    site: &str,
+    instance: &str,
+    port: u16,
+    use_fixed: bool,
 ) -> Option<SocketAddr> {
-    snapshot.lbs.get(site).and_then(|lb| lb.select(client))
+    let resolved = resolve_instance_pick(snapshot, site, instance).await?;
+    pick_upstream(&resolved, port, use_fixed)
+}
+
+/// Whether a forward instance pick should retry once against its fixed address.
+///
+/// Only an instance pick with a distinct fixed address qualifies; the retry
+/// reuses the *same* pick (never re-selects).
+pub fn instance_fallback(
+    pick: Option<&PoolPick>,
+    resolved: Option<&ResolvedInstance>,
+    retries: u32,
+) -> bool {
+    matches!(pick, Some(PoolPick::Instance { .. }))
+        && resolved
+            .map(|resolved| should_fallback_to_fixed(resolved, retries))
+            .unwrap_or(false)
+}
+
+/// The pick to reuse on a retry (C3).
+///
+/// An instance pick is pinned so a retry can never land on a different
+/// instance; static picks return `None` here, so a static site keeps
+/// re-selecting across retries (unchanged P3 behaviour).
+pub fn reuse_pick(existing: &Option<PoolPick>, retries: u32) -> Option<PoolPick> {
+    match existing {
+        Some(pick @ PoolPick::Instance { .. }) if retries > 0 => Some(pick.clone()),
+        _ => None,
+    }
 }
 
 /// Whether another upstream attempt is allowed after `failures` connect
@@ -356,8 +465,13 @@ pub async fn openstack_gate(
         return OpenStackOutcome::Deny(code);
     }
 
-    let Some(resolver) = snapshot.resolvers.get(&site_name).cloned() else {
-        tracing::error!(site = %site_name, "no resolver configured for openstack site");
+    // Resolvers are keyed by the site's referenced environment (C3).
+    let Some(resolver) = snapshot.resolvers.get(&site.openstack_env).cloned() else {
+        tracing::error!(
+            site = %site_name,
+            env = %site.openstack_env,
+            "no resolver configured for openstack site's environment"
+        );
         return OpenStackOutcome::Deny(502);
     };
 
@@ -549,14 +663,53 @@ impl ProxyHttp for IrisProxy {
                     )
                 })?;
 
-                // Selection runs here (not in `request_filter`) so each retry
-                // re-runs load balancing and can land on a different backend.
-                select_backend(snapshot, &site, client_ip(session)).ok_or_else(|| {
-                    Error::explain(
-                        ErrorType::HTTPStatus(502),
-                        format!("no healthy upstream for forward site '{site}'"),
-                    )
-                })?
+                // An instance pick is pinned for a retry (so the fallback
+                // retries the same instance); everything else re-selects here
+                // so each attempt re-runs load balancing.
+                let pick = match reuse_pick(&ctx.pool_pick, ctx.retries) {
+                    Some(pinned) => pinned,
+                    None => {
+                        let pick = select_backend(snapshot, &site, client_ip(session))
+                            .ok_or_else(|| {
+                                Error::explain(
+                                    ErrorType::HTTPStatus(502),
+                                    format!("no healthy upstream for forward site '{site}'"),
+                                )
+                            })?;
+                        ctx.pool_pick = Some(pick.clone());
+                        pick
+                    }
+                };
+
+                match pick {
+                    PoolPick::Static(addr) => {
+                        ctx.resolved = None;
+                        addr
+                    }
+                    PoolPick::Instance { instance, port } => {
+                        // Record the resolution on the Ctx so `fail_to_connect`
+                        // can fall back to this same pick's fixed address.
+                        let resolved = resolve_instance_pick(snapshot, &site, &instance)
+                            .await
+                            .ok_or_else(|| {
+                                Error::explain(
+                                    ErrorType::HTTPStatus(502),
+                                    format!(
+                                        "forward instance '{instance}' on site '{site}' could not be resolved"
+                                    ),
+                                )
+                            })?;
+                        ctx.resolved = Some(resolved);
+                        pick_upstream(&resolved, port, ctx.use_fixed).ok_or_else(|| {
+                            Error::explain(
+                                ErrorType::HTTPStatus(502),
+                                format!(
+                                    "no usable address for forward instance '{instance}' on site '{site}'"
+                                ),
+                            )
+                        })?
+                    }
+                }
             }
         };
         ctx.upstream = Some(addr);
@@ -589,7 +742,24 @@ impl ProxyHttp for IrisProxy {
                 }
                 fallback
             }
-            _ => should_retry_connect(ctx.retries, MAX_CONNECT_RETRIES),
+            _ => match ctx.pool_pick.as_ref() {
+                // Instance pick: retry once against the SAME instance's fixed
+                // address (never re-select a different instance); if it has no
+                // distinct fixed address, fail the request rather than retry.
+                Some(PoolPick::Instance { .. }) => {
+                    if instance_fallback(
+                        ctx.pool_pick.as_ref(),
+                        ctx.resolved.as_ref(),
+                        ctx.retries,
+                    ) {
+                        ctx.use_fixed = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => should_retry_connect(ctx.retries, MAX_CONNECT_RETRIES),
+            },
         };
         e.set_retry(retry);
         tracing::warn!(
@@ -701,15 +871,36 @@ mod tests {
     // ----- select_backend -----
 
     #[test]
-    fn select_backend_returns_a_pool_member() {
+    fn select_backend_returns_a_static_pool_pick() {
         let state = state(
             vec![forward_site("www", "www.example.com", &[(18081, 1), (18082, 1)])],
             vec![],
         );
         let selected = select_backend(&state.snapshot(), "www", Some(IpAddr::from([10, 0, 0, 1])));
         assert!(
-            selected == Some(SocketAddr::from(([127, 0, 0, 1], 18081)))
-                || selected == Some(SocketAddr::from(([127, 0, 0, 1], 18082)))
+            selected == Some(PoolPick::Static(SocketAddr::from(([127, 0, 0, 1], 18081))))
+                || selected == Some(PoolPick::Static(SocketAddr::from(([127, 0, 0, 1], 18082))))
+        );
+    }
+
+    #[test]
+    fn select_backend_returns_an_instance_pick() {
+        let mut site = forward_site("apps", "apps.example.com", &[]);
+        site.openstack_env = Some("prod".to_owned());
+        site.backends = vec![Backend {
+            target: BackendTarget::Instance {
+                instance: "INS001".to_owned(),
+                port: 8080,
+            },
+            weight: 1,
+        }];
+        let state = state(vec![site], vec![]);
+        assert_eq!(
+            select_backend(&state.snapshot(), "apps", None),
+            Some(PoolPick::Instance {
+                instance: "INS001".to_owned(),
+                port: 8080,
+            })
         );
     }
 
@@ -937,6 +1128,145 @@ mod tests {
         assert!(!should_fallback_to_fixed(&same, 1));
     }
 
+    // ----- C3: forward instance pick / retry decisions -----
+
+    #[test]
+    fn instance_fallback_retries_the_same_pick_once() {
+        let pick = PoolPick::Instance {
+            instance: "INS001".to_owned(),
+            port: 8080,
+        };
+        let distinct = resolved(Some([203, 0, 113, 10]), Some([192, 168, 1, 10]));
+        assert!(instance_fallback(Some(&pick), Some(&distinct), 1));
+        assert!(
+            !instance_fallback(Some(&pick), Some(&distinct), 2),
+            "one retry only"
+        );
+        // No distinct fixed address -> no retry.
+        assert!(!instance_fallback(
+            Some(&pick),
+            Some(&resolved(Some([203, 0, 113, 11]), None)),
+            1
+        ));
+        // A static pick never uses the instance fallback path.
+        let static_pick = PoolPick::Static(SocketAddr::from(([127, 0, 0, 1], 80)));
+        assert!(!instance_fallback(Some(&static_pick), Some(&distinct), 1));
+    }
+
+    #[test]
+    fn reuse_pick_pins_instances_and_reselects_static() {
+        let instance = PoolPick::Instance {
+            instance: "INS001".to_owned(),
+            port: 8080,
+        };
+        assert_eq!(reuse_pick(&Some(instance.clone()), 1), Some(instance.clone()));
+        assert_eq!(reuse_pick(&Some(instance), 0), None, "first attempt selects fresh");
+        let static_pick = PoolPick::Static(SocketAddr::from(([127, 0, 0, 1], 80)));
+        assert_eq!(
+            reuse_pick(&Some(static_pick), 1),
+            None,
+            "static picks re-select on retry"
+        );
+        assert_eq!(reuse_pick(&None, 1), None);
+    }
+
+    fn instance_site(name: &str, domain: &str) -> ForwardSite {
+        ForwardSite {
+            name: name.to_owned(),
+            domain: domain.to_owned(),
+            http: true,
+            https: false,
+            cert_file: None,
+            key_file: None,
+            openstack_env: Some("prod".to_owned()),
+            backends: vec![Backend {
+                target: BackendTarget::Instance {
+                    instance: "INS001".to_owned(),
+                    port: 8080,
+                },
+                weight: 1,
+            }],
+            lb_mode: LbMode::RoundRobin,
+            health_check: None,
+        }
+    }
+
+    /// A state with an instance site whose env resolver is injected under the
+    /// environment key (`prod`).
+    fn instance_state(resolver: Arc<dyn crate::openstack::Resolver>) -> SharedState {
+        let shared = state(vec![instance_site("apps", "apps.example.com")], vec![]);
+        let mut snapshot = shared.snapshot().shallow();
+        let mut map = (*snapshot.resolvers).clone();
+        map.insert("prod".to_owned(), resolver);
+        snapshot.resolvers = Arc::new(map);
+        shared.store(snapshot);
+        shared
+    }
+
+    #[tokio::test]
+    async fn forward_instance_pick_resolves_on_the_fly_with_fixed_fallback() {
+        let shared = instance_state(Arc::new(FakeResolver::ok(resolved(
+            Some([203, 0, 113, 10]),
+            Some([192, 168, 1, 10]),
+        ))));
+        let snapshot = shared.snapshot();
+        assert_eq!(
+            pick_instance_upstream(&snapshot, "apps", "INS001", 8080, false).await,
+            Some(SocketAddr::from(([203, 0, 113, 10], 8080)))
+        );
+        // The retry attempt uses the fixed address of the SAME pick.
+        assert_eq!(
+            pick_instance_upstream(&snapshot, "apps", "INS001", 8080, true).await,
+            Some(SocketAddr::from(([192, 168, 1, 10], 8080)))
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_instance_pick_prefers_the_pool_cached_resolution() {
+        // The resolver always errors; a seeded cache still serves the address.
+        let shared = instance_state(Arc::new(FakeResolver::err(
+            ResolveError::DiscoveryUnavailable("down".to_owned()),
+        )));
+        let snapshot = shared.snapshot();
+        match snapshot.lbs.get("apps").expect("pool").as_ref() {
+            crate::lb::ForwardBackends::Instance(pool) => {
+                pool.seed_resolution("INS001", resolved(Some([203, 0, 113, 10]), None));
+            }
+            crate::lb::ForwardBackends::Static(_) => panic!("expected an instance pool"),
+        }
+        assert_eq!(
+            pick_instance_upstream(&snapshot, "apps", "INS001", 8080, false).await,
+            Some(SocketAddr::from(([203, 0, 113, 10], 8080)))
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_instance_resolution_failures_all_map_to_none() {
+        // Every resolve error becomes a request-time 502 (i.e. `None` here).
+        for err in [
+            ResolveError::NotFound,
+            ResolveError::NoAddress,
+            ResolveError::AuthFailed,
+            ResolveError::DiscoveryUnavailable("down".to_owned()),
+        ] {
+            let shared = instance_state(Arc::new(FakeResolver::err(err)));
+            assert_eq!(
+                pick_instance_upstream(&shared.snapshot(), "apps", "INS001", 8080, false).await,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_instance_pick_without_resolver_is_none() {
+        // An instance site with no env resolver cannot resolve -> 502.
+        let shared = state(vec![instance_site("apps", "apps.example.com")], vec![]);
+        assert_eq!(
+            pick_instance_upstream(&shared.snapshot(), "apps", "INS001", 8080, false).await,
+            None
+        );
+    }
+
     // ----- P7: openstack_gate orchestration (fake Resolver injected) -----
 
     /// A fake resolver: the sanctioned external-boundary stub for the trait
@@ -1006,7 +1336,7 @@ mod tests {
             Some([203, 0, 113, 10]),
             Some([192, 168, 1, 10]),
         )));
-        inject_resolver(&shared, "rent", fake.clone());
+        inject_resolver(&shared, "prod", fake.clone());
 
         let outcome = openstack_gate(&shared.snapshot(), 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(
@@ -1033,7 +1363,7 @@ mod tests {
             )],
         );
         let fake = Arc::new(FakeResolver::ok(resolved(Some([203, 0, 113, 10]), None)));
-        inject_resolver(&shared, "rent", fake.clone());
+        inject_resolver(&shared, "prod", fake.clone());
 
         // Port 8080 is not open for `web`.
         let outcome = openstack_gate(&shared.snapshot(), 0, "web", 8080, Some(ip([127, 0, 0, 1]))).await;
@@ -1053,7 +1383,7 @@ mod tests {
                 Some(dir.path()),
             )],
         );
-        inject_resolver(&shared, "rent", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
+        inject_resolver(&shared, "prod", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
 
         let outcome = openstack_gate(&shared.snapshot(), 0, "ghost", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(outcome, OpenStackOutcome::Deny(403));
@@ -1075,7 +1405,7 @@ mod tests {
                 Some(dir.path()),
             )],
         );
-        inject_resolver(&shared, "rent", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
+        inject_resolver(&shared, "prod", Arc::new(FakeResolver::ok(resolved(Some([10, 0, 0, 1]), None))));
 
         let outcome = openstack_gate(&shared.snapshot(), 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
         assert_eq!(outcome, OpenStackOutcome::Deny(403));
@@ -1093,7 +1423,7 @@ mod tests {
             ),
             (ResolveError::NoAddress, 502),
         ] {
-            inject_resolver(&shared, "rent", Arc::new(FakeResolver::err(err)));
+            inject_resolver(&shared, "prod", Arc::new(FakeResolver::err(err)));
             let outcome = openstack_gate(&shared.snapshot(), 0, "web", 80, Some(ip([127, 0, 0, 1]))).await;
             assert_eq!(outcome, OpenStackOutcome::Deny(want));
         }

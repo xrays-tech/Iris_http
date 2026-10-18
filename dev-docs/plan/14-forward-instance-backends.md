@@ -173,3 +173,38 @@ C1→C2→C3 串行（C2/C3 都依赖 C1 类型；C2/C3 均触碰 state/reload/p
 - nova.rs 新增 `pub(crate) async fn query_server_by_id`（契约未列；作为 show-by-id 网络层归属地，非签名变更、未扩公共 API）。
 - 契约未规定 `decode_server` 对 list-only 信封的行为——本实现严格只接受 `{"server":{...}}`，list-only/畸形 → `Decode`（单实例语义）。
 - `NovaError` 未新增变体；无其它签名偏离。
+
+## C3 forward 实例路由 — 阶段记录
+
+状态：**完成**。
+
+实现要点（与上方 C3 TDD 清单一致）：
+
+- `src/lb.rs`：
+  - 新增 `ForwardBackends`（`Static(Arc<LbEngine>)` / `Instance(Arc<InstancePool>)`）、`PoolPick`（`Static` / `Instance{instance,port}`）与 `build_forward_backends(site, registry, snapshot)`：站点含 ≥1 个 instance 后端 → `Instance` 池，否则沿用 `build_lb` 的 `Static` 引擎。
+  - `InstancePool`：`new(site_env, backends, mode, snapshot)`（weight=0 完全排除、`build_entries` 默认健康）；`select` 仅取健康+启用项，round_robin / weighted_round_robin（游标）/ random（`RandomState`）/ **ketama（键=实例身份名/UUID，绝不用 resolved IP）**；`update` 按 `health_key`（`addr:<addr>` 或 `instance:<name>:<port>`）续用健康位并淘汰移除实例的缓存解析；`resolved(instance)` 返回最近解析；无健康项 → `None`。
+  - `instance_health_service(snapshot)`：单一 `BackgroundService`，仅遍历 `ForwardBackends::Instance` 站点；`site.health_check` 缺省则该站点无探针循环（启用项全可选，故障请求时 502）；`probe_instances` 先快照条目种类并释放锁，`await` 解析（走环境 resolver 缓存）+ `probe_addr` 探活，再回锁按 `health_key` 落库；解析失败/无地址 → 不健康。
+  - `ProbeRegistry::sync` 跳过含 instance 后端的站点（`has_instance`），避免经共享 `HealthRegistry` 二次探测/健康分叉。
+- `src/state.rs`：`Snapshot.lbs: Arc<HashMap<String, Arc<ForwardBackends>>>`；`build_lbs` 用 `build_forward_backends` 装配；引入 bootstrap `ArcSwap<Snapshot>` 句柄供 `InstancePool` 捕获（真实快照在返回 `SharedState` 前 store 入同一句柄）；`SharedState::lb` → `Option<Arc<ForwardBackends>>`；`resolver_for`/`Snapshot.resolvers` 键语义改为**环境名**（经 `build_env_resolvers`）。
+- `src/proxy.rs`：`Ctx` 增 `pool_pick`（加性，契约已列）；`select_backend` → `Option<PoolPick>`；forward lane `upstream_peer` 分派 `Static`（直接拨号）与 `Instance`（缓存解析优先→现场 resolve，记录 `ctx.resolved`）；纯函数 `reuse_pick`（instance pick 重试钉住同拾）+ `instance_fallback`（同 pick 回退 fixed 重试一次，绝不 re-select）；`fail_to_connect` 对 instance pick 走同拾回退；openstack 分支 resolver 查找改 `site.openstack_env`。
+- `src/reload.rs`：forward 池四元比较（`backends`/`lb_mode`/`health_check`/`openstack_env`）复用 `Arc<ForwardBackends>`（重建经 `build_forward_backends(site, &old.registry, state.handle())`）；resolver 按**环境名**键 + `OpenStackConfig` 相等复用。
+- `src/main.rs`：启动时并注册 `instance_health_service(shared.handle())`（与静态站点 `health_check_service` 并存）。
+- `src/openstack/mod.rs`：删除 `build_resolvers`（站点名键），保留/切换到 `build_env_resolvers`（环境名键）。
+- `scripts/e2e/12-forward-instance.sh`：新建（含 hermetic fixtures 内联生成）。
+
+验证输出：
+
+- `cargo build`：0 warning / 0 error；`cargo build --tests`：0 warning / 0 error。
+- `cargo test`：**360 passed / 0 failed**（6 suites）：lib 254、bin 7、`config_load` 71、`firewall` 11、`openstack` 17。（基线 327 → +33，全部落在 lib：`ForwardBackends`/`InstancePool`/健康服务/proxy 选择与回退/state·reload 复用等单测。）
+- e2e：`03-forward`、`04-tls`、`07-openstack`、`08-reload`、`09-health-reload`、`10-tls-reload`、`11-health-reload-new-site`、`12-forward-instance` **全部 PASS**（12 为本 lane 新增，其余为回归）。
+- `12-forward-instance.sh` 观测（全部断言通过）：加权 2:1 分发（A=20/B=10）；name（`name=appA`）+ UUID（`/servers/<uuid>`）混用各 1 次查控平面；Keystone token 恰 1 次且 warm 路径不重取；删除 fixture 后并发 10 请求全 502 且 Nova 仅 1 次查询（单飞）；TCP 健康探针剔除死实例并恢复后重新纳入；热 reload 移除 UUID 后端后仅保留后端被选中（`config_reload_total{ok="true"} 1`）。
+- 生产代码无 unwrap/expect/panic/unreachable/todo/unimplemented（仅 `#[cfg(test)]` 豁免；已逐文件核验）。
+
+偏离/新增（供审阅）：
+
+- **`build_lb` 保持签名不变**（契约钉死）：任务描述"build_lb 返回 Static variant"理解为"Static variant 经 `build_lb` 构造"；Static-vs-Instance 的装配落在新增的 `build_forward_backends(site, registry, snapshot)`（契约未列，加性、未改公共签名）。
+- **reload resolver 复用为内联按环境名实现**（`site.openstack_env` 查找 + `OpenStackConfig` 相等），未改为调用 `build_env_resolvers`（后者每次新建、无法复用同一 `Arc<dyn Resolver>`）。效果与契约 §reload 语义一致。
+- `PoolPick` 增加 `#[derive(Hash)]`（仅 trait，便于单测用 `HashSet` 断言选择集合；无签名/行为变更）。
+- 测试专用 seam（均在 `#[cfg(test)]`）：`ForwardBackends::select_static`、`InstancePool::seed_resolution`；契约未列，仅测试可见。
+- `state.rs` 引入 bootstrap `ArcSwap<Snapshot>` 句柄使 `InstancePool` 能捕获快照（`Snapshot.lbs` 与池对 snapshot 的引用形成装配顺序问题）；对外契约（`SharedState::handle`/`lb`/`resolver_for`）不变。
+- 未触碰 `02-contracts.md`（未发现契约缺陷）。

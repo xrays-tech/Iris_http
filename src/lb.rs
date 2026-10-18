@@ -35,7 +35,7 @@
 //! never added to the Pingora backend set, never selected, and therefore never
 //! health-checked (`config.md` §3, `plan/06` §TDD).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use pingora_load_balancing::discovery::ServiceDiscovery;
 use pingora_load_balancing::health_check::{
@@ -56,7 +57,9 @@ use pingora_load_balancing::{
     Backend as PoolBackend, Backends, HealthCheckService, HealthRegistry, LoadBalancer,
 };
 
-use crate::config::{Backend, BackendTarget, Config, HealthCheck, HealthKind, LbMode};
+use crate::config::{Backend, BackendTarget, Config, ForwardSite, HealthCheck, HealthKind, LbMode};
+use crate::openstack::ResolvedInstance;
+use crate::state::Snapshot;
 
 /// Upper bound on the number of candidate backends examined per selection.
 ///
@@ -248,6 +251,537 @@ pub fn health_check_service(registry: Arc<HealthRegistry>) -> impl BackgroundSer
 }
 
 // ---------------------------------------------------------------------------
+// ForwardBackends: static (Pingora LB) or instance-driven pool per site (C3).
+// ---------------------------------------------------------------------------
+
+/// A forward site's backend pool: the static Pingora path, or the
+/// instance-driven [`InstancePool`] (`02-contracts.md` §ForwardBackends).
+pub enum ForwardBackends {
+    /// Every backend is an `addr` literal → the existing Pingora engine +
+    /// shared health-registry path.
+    Static(Arc<LbEngine>),
+    /// At least one backend references an OpenStack instance → probe-driven
+    /// selection over resolved addresses.
+    Instance(Arc<InstancePool>),
+}
+
+impl ForwardBackends {
+    /// Select the concrete static address for a site (test/reload convenience).
+    ///
+    /// Only meaningful for a [`ForwardBackends::Static`] pool; an instance pool
+    /// has no single static address and yields `None`.
+    #[cfg(test)]
+    pub(crate) fn select_static(&self, key: Option<IpAddr>) -> Option<SocketAddr> {
+        match self {
+            Self::Static(lb) => lb.select(key),
+            Self::Instance(pool) => match pool.select(key) {
+                Some(PoolPick::Static(addr)) => Some(addr),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The outcome of selecting from a site's pool.
+///
+/// [`PoolPick::Static`] is a ready-to-dial address; [`PoolPick::Instance`]
+/// carries the instance identity (ketama key) and the configured port, to be
+/// resolved to an address at request time.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PoolPick {
+    /// A literal `addr` backend.
+    Static(SocketAddr),
+    /// An `instance` backend: resolve `instance` and dial `port`.
+    Instance {
+        /// Instance name or UUID (also the ketama identity key).
+        instance: String,
+        /// Target port on the instance.
+        port: u16,
+    },
+}
+
+/// Build the site-level backend pool: [`ForwardBackends::Static`] for an
+/// all-`addr` site, [`ForwardBackends::Instance`] once any backend references
+/// an instance.
+///
+/// The instance pool captures the site's `openstack_env` so it resolves through
+/// the shared, env-keyed resolver in `snapshot`.
+pub fn build_forward_backends(
+    site: &ForwardSite,
+    registry: &Arc<HealthRegistry>,
+    snapshot: Arc<ArcSwap<Snapshot>>,
+) -> Arc<ForwardBackends> {
+    let has_instance = site
+        .backends
+        .iter()
+        .any(|backend| matches!(backend.target, BackendTarget::Instance { .. }));
+    if has_instance {
+        Arc::new(ForwardBackends::Instance(Arc::new(InstancePool::new(
+            site.openstack_env.as_deref().unwrap_or_default(),
+            &site.backends,
+            &site.lb_mode,
+            snapshot,
+        ))))
+    } else {
+        Arc::new(ForwardBackends::Static(build_lb(
+            &site.backends,
+            &site.lb_mode,
+            registry,
+        )))
+    }
+}
+
+/// The instance-driven backend pool for one forward site (C3).
+///
+/// Entries are the site's enabled (`weight > 0`) backends. `addr` entries are
+/// dialed directly; `instance` entries are resolved (floating preferred, fixed
+/// fallback) through the site's env resolver and dialed at the configured port.
+/// Selection only ever considers *healthy* entries; [`instance_health_service`]
+/// updates the per-entry health bit and caches the latest resolution.
+///
+/// The ketama ring is keyed on the **instance identity** (name/UUID) — never on
+/// the resolved address, which drifts across re-resolutions and would reshuffle
+/// every client — so a given client keeps hitting the same backend.
+pub struct InstancePool {
+    site_env: String,
+    mode: LbMode,
+    snapshot: Arc<ArcSwap<Snapshot>>,
+    state: Mutex<PoolState>,
+}
+
+/// Mutable pool state guarded by one short-lived lock (never held across an
+/// `await`).
+struct PoolState {
+    entries: Vec<PoolEntry>,
+    /// Round-robin / weighted-round-robin cursor.
+    cursor: usize,
+    /// Last successfully resolved address per instance identity.
+    cached: HashMap<String, ResolvedInstance>,
+}
+
+/// One enabled pool entry plus its observed health.
+struct PoolEntry {
+    kind: EntryKind,
+    weight: u32,
+    healthy: bool,
+}
+
+/// The identity of a pool entry: a literal address or an instance + port.
+#[derive(Clone)]
+enum EntryKind {
+    Static(SocketAddr),
+    Instance { instance: String, port: u16 },
+}
+
+impl EntryKind {
+    /// A stable key used to carry health across an [`InstancePool::update`].
+    fn health_key(&self) -> String {
+        match self {
+            Self::Static(addr) => format!("addr:{addr}"),
+            Self::Instance { instance, port } => format!("instance:{instance}:{port}"),
+        }
+    }
+
+    /// The ketama identity: instance name/UUID, or the literal address.
+    fn identity(&self) -> String {
+        match self {
+            Self::Static(addr) => addr.to_string(),
+            Self::Instance { instance, .. } => instance.clone(),
+        }
+    }
+
+    fn to_pick(&self) -> PoolPick {
+        match self {
+            Self::Static(addr) => PoolPick::Static(*addr),
+            Self::Instance { instance, port } => PoolPick::Instance {
+                instance: instance.clone(),
+                port: *port,
+            },
+        }
+    }
+}
+
+/// Ketama virtual nodes per unit of weight.
+const KETAMA_REPLICAS: usize = 64;
+
+impl InstancePool {
+    /// Build a pool for one site.
+    ///
+    /// `site_env` is the OpenStack environment name the site references; the
+    /// pool resolves its instances through `snapshot.resolvers[site_env]`.
+    pub fn new(
+        site_env: &str,
+        backends: &[Backend],
+        mode: &LbMode,
+        snapshot: Arc<ArcSwap<Snapshot>>,
+    ) -> Self {
+        Self {
+            site_env: site_env.to_owned(),
+            mode: *mode,
+            snapshot,
+            state: Mutex::new(PoolState {
+                entries: build_entries(backends, &HashMap::new()),
+                cursor: 0,
+                cached: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Select a healthy, enabled entry (`None` when every entry is unhealthy or
+    /// disabled). `hash_key` (the client IP) is only used by ketama.
+    pub fn select(&self, hash_key: Option<IpAddr>) -> Option<PoolPick> {
+        let mut guard = lock(&self.state);
+        // Deref once so `entries` / `cursor` are disjoint field borrows.
+        let state = &mut *guard;
+        let healthy: Vec<usize> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.weight > 0 && entry.healthy)
+            .map(|(idx, _)| idx)
+            .collect();
+        if healthy.is_empty() {
+            return None;
+        }
+
+        let position = match self.mode {
+            LbMode::RoundRobin => round_robin_pick(healthy.len(), &mut state.cursor),
+            LbMode::WeightedRoundRobin => {
+                weighted_pick(&state.entries, &healthy, &mut state.cursor)
+            }
+            LbMode::Random => random_pick(healthy.len()),
+            LbMode::Ketama => {
+                let nodes: Vec<(String, u32)> = healthy
+                    .iter()
+                    .map(|&idx| {
+                        let entry = &state.entries[idx];
+                        (entry.kind.identity(), entry.weight)
+                    })
+                    .collect();
+                ketama_index(&nodes, hash_key)
+            }
+        }?;
+
+        state
+            .entries
+            .get(healthy[position])
+            .map(|entry| entry.kind.to_pick())
+    }
+
+    /// Replace the entry set, carrying the observed health of a retained
+    /// `instance`/`addr` over (a changed identity starts healthy).
+    pub fn update(&self, backends: &[Backend]) {
+        let mut state = lock(&self.state);
+        let mut old_health: HashMap<String, bool> = HashMap::with_capacity(state.entries.len());
+        for entry in &state.entries {
+            old_health.insert(entry.kind.health_key(), entry.healthy);
+        }
+        let entries = build_entries(backends, &old_health);
+
+        // Drop cached resolutions for instances that are no longer present.
+        let present: HashSet<String> = entries
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Instance { instance, .. } => Some(instance.clone()),
+                EntryKind::Static(_) => None,
+            })
+            .collect();
+        state.cached.retain(|instance, _| present.contains(instance));
+
+        state.entries = entries;
+        state.cursor = 0;
+    }
+
+    /// The latest resolved address for `instance`, if any probe has cached one.
+    pub fn resolved(&self, instance: &str) -> Option<ResolvedInstance> {
+        lock(&self.state).cached.get(instance).copied()
+    }
+
+    /// Seed the resolution cache (test seam for the proxy's cached-address path).
+    #[cfg(test)]
+    pub(crate) fn seed_resolution(&self, instance: &str, resolved: ResolvedInstance) {
+        lock(&self.state).cached.insert(instance.to_owned(), resolved);
+    }
+
+    /// Probe every entry once, updating health and the resolution cache.
+    ///
+    /// A static entry is probed directly. An instance entry is first resolved
+    /// through the site's env resolver (a cached resolve) and then probed at
+    /// its primary address; a resolution failure marks it unhealthy.
+    pub(crate) async fn probe_instances(&self, probe: &(dyn HealthCheckProbe + Send + Sync)) {
+        // Snapshot the entry kinds and release the lock before awaiting.
+        let kinds: Vec<EntryKind> = {
+            let state = lock(&self.state);
+            state.entries.iter().map(|entry| entry.kind.clone()).collect()
+        };
+        let resolver = self.snapshot.load().resolvers.get(&self.site_env).cloned();
+
+        let mut updates: HashMap<String, (bool, Option<(String, ResolvedInstance)>)> =
+            HashMap::with_capacity(kinds.len());
+        for kind in &kinds {
+            match kind {
+                EntryKind::Static(addr) => {
+                    let healthy = probe_addr(probe, *addr).await;
+                    updates.insert(kind.health_key(), (healthy, None));
+                }
+                EntryKind::Instance { instance, port } => match &resolver {
+                    Some(resolver) => match resolver.resolve(instance).await {
+                        Ok(resolved) => {
+                            let healthy = match resolved.primary() {
+                                Some(ip) => probe_addr(probe, SocketAddr::new(ip, *port)).await,
+                                None => false,
+                            };
+                            updates.insert(
+                                kind.health_key(),
+                                (healthy, Some((instance.clone(), resolved))),
+                            );
+                        }
+                        Err(err) => {
+                            tracing::debug!(
+                                instance = %instance,
+                                error = %err,
+                                "forward instance resolution failed; marking unhealthy"
+                            );
+                            updates.insert(kind.health_key(), (false, None));
+                        }
+                    },
+                    None => {
+                        tracing::debug!(
+                            instance = %instance,
+                            env = %self.site_env,
+                            "no resolver for the site's openstack env; marking unhealthy"
+                        );
+                        updates.insert(kind.health_key(), (false, None));
+                    }
+                },
+            }
+        }
+
+        let mut state = lock(&self.state);
+        let PoolState {
+            entries, cached, ..
+        } = &mut *state;
+        for entry in entries.iter_mut() {
+            if let Some((healthy, resolved)) = updates.get(&entry.kind.health_key()) {
+                entry.healthy = *healthy;
+                if let Some((instance, resolved)) = resolved {
+                    cached.insert(instance.clone(), *resolved);
+                }
+            }
+        }
+    }
+}
+
+/// Build the enabled entry list, carrying health over by identity key.
+fn build_entries(backends: &[Backend], old_health: &HashMap<String, bool>) -> Vec<PoolEntry> {
+    backends
+        .iter()
+        .filter(|backend| backend.weight > 0)
+        .map(|backend| {
+            let kind = match &backend.target {
+                BackendTarget::Addr(addr) => EntryKind::Static(*addr),
+                BackendTarget::Instance { instance, port } => EntryKind::Instance {
+                    instance: instance.clone(),
+                    port: *port,
+                },
+            };
+            let healthy = old_health.get(&kind.health_key()).copied().unwrap_or(true);
+            PoolEntry {
+                kind,
+                weight: backend.weight,
+                healthy,
+            }
+        })
+        .collect()
+}
+
+/// Pick a position within `healthy` for equal-weight round robin.
+fn round_robin_pick(len: usize, cursor: &mut usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let position = *cursor % len;
+    *cursor = (*cursor + 1) % len;
+    Some(position)
+}
+
+/// Pick a position within `healthy` for weighted round robin.
+fn weighted_pick(entries: &[PoolEntry], healthy: &[usize], cursor: &mut usize) -> Option<usize> {
+    let total: usize = healthy
+        .iter()
+        .map(|&idx| entries[idx].weight as usize)
+        .sum();
+    if total == 0 {
+        return None;
+    }
+    let mut remaining = *cursor % total;
+    *cursor = (*cursor + 1) % total;
+    for (position, &idx) in healthy.iter().enumerate() {
+        let weight = entries[idx].weight as usize;
+        if remaining < weight {
+            return Some(position);
+        }
+        remaining -= weight;
+    }
+    // Unreachable given `total` accounts for every healthy weight.
+    healthy.last().copied()
+}
+
+/// Pick a position within `healthy` uniformly at random.
+fn random_pick(len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u8(0);
+    Some((hasher.finish() as usize) % len)
+}
+
+/// Pick a position within `nodes` (identity + weight) by consistent hashing of
+/// `key` (the client IP) over a ring of identity-keyed virtual nodes.
+fn ketama_index(nodes: &[(String, u32)], key: Option<IpAddr>) -> Option<usize> {
+    if nodes.is_empty() {
+        return None;
+    }
+    let mut ring: Vec<(u64, usize)> = Vec::new();
+    for (position, (identity, weight)) in nodes.iter().enumerate() {
+        let replicas = (*weight as usize).max(1) * KETAMA_REPLICAS;
+        for replica in 0..replicas {
+            ring.push((hash_identity(identity, replica as u64), position));
+        }
+    }
+    ring.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let digest = hash_key(key);
+    let index = match ring.binary_search_by(|point| point.0.cmp(&digest)) {
+        Ok(index) => index,
+        Err(index) => {
+            if index == ring.len() {
+                0
+            } else {
+                index
+            }
+        }
+    };
+    ring.get(index).map(|point| point.1)
+}
+
+/// Hash an identity + replica index onto the ketama ring.
+fn hash_identity(identity: &str, replica: u64) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    identity.hash(&mut hasher);
+    replica.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Hash the client key for a ketama lookup.
+fn hash_key(key: Option<IpAddr>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    match key {
+        Some(IpAddr::V4(addr)) => addr.octets().hash(&mut hasher),
+        Some(IpAddr::V6(addr)) => addr.octets().hash(&mut hasher),
+        None => 0u8.hash(&mut hasher),
+    }
+    hasher.finish()
+}
+
+/// Run one health probe against a bare `addr`.
+async fn probe_addr(probe: &(dyn HealthCheckProbe + Send + Sync), addr: SocketAddr) -> bool {
+    match PoolBackend::new_with_weight(&addr.to_string(), 1) {
+        Ok(backend) => probe.check(&backend).await.is_ok(),
+        Err(err) => {
+            tracing::debug!(error = %err, %addr, "invalid health-check target");
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instance health service (C3): the probe loop for Instance pools only.
+// ---------------------------------------------------------------------------
+
+/// Build the background service that probes [`ForwardBackends::Instance`] pools.
+///
+/// The static [`health_check_service`] gates every `addr` backend through the
+/// shared [`HealthRegistry`]; this service complements it by resolving and
+/// probing the instance pools, which the registry never sees
+/// ([`ProbeRegistry::sync`] skips them). A site with no `health_check` gets no
+/// probe loop at all: its enabled entries stay selectable and a failure
+/// surfaces as a request-time `502`.
+pub fn instance_health_service(snapshot: Arc<ArcSwap<Snapshot>>) -> impl BackgroundService {
+    InstanceHealthService {
+        snapshot,
+        last: Mutex::new(HashMap::new()),
+    }
+}
+
+/// The [`BackgroundService`] that drives instance-pool probes.
+struct InstanceHealthService {
+    snapshot: Arc<ArcSwap<Snapshot>>,
+    /// Last probe time per site, enforcing each site's `interval_secs`.
+    last: Mutex<HashMap<String, Instant>>,
+}
+
+impl InstanceHealthService {
+    /// Probe every due instance-pool site once.
+    async fn tick(&self) {
+        let snapshot = self.snapshot.load_full();
+        for site in &snapshot.config.forward {
+            let Some(health_check) = site.health_check.as_ref() else {
+                continue;
+            };
+            let Some(ForwardBackends::Instance(pool)) =
+                snapshot.lbs.get(&site.name).map(Arc::as_ref)
+            else {
+                continue;
+            };
+            if !self.due(&site.name, health_check.interval_secs) {
+                continue;
+            }
+            let probe = build_probe(health_check);
+            pool.probe_instances(probe.as_ref()).await;
+        }
+    }
+
+    /// Whether `site` is due for a probe under its `interval_secs`.
+    fn due(&self, site: &str, interval_secs: u64) -> bool {
+        let mut last = lock(&self.last);
+        let now = Instant::now();
+        let interval = Duration::from_secs(interval_secs.max(1));
+        match last.get(site) {
+            Some(at) if now.duration_since(*at) < interval => false,
+            _ => {
+                last.insert(site.to_owned(), now);
+                true
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl BackgroundService for InstanceHealthService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let mut ticker = tokio::time::interval(HEALTH_CHECK_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = ticker.tick() => self.tick().await,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ProbeRegistry: the single dispatching probe behind the shared registry.
 // ---------------------------------------------------------------------------
 
@@ -327,6 +861,16 @@ impl ProbeRegistry {
         let mut slots = lock(&self.slots);
         let mut next: HashMap<u64, Arc<ProbeSlot>> = HashMap::with_capacity(slots.len());
         for site in &config.forward {
+            // A site whose pool is `ForwardBackends::Instance` is probed by
+            // `instance_health_service`, not the shared registry: probing here
+            // too would double-probe and split the health state (C3 contract).
+            if site
+                .backends
+                .iter()
+                .any(|backend| matches!(backend.target, BackendTarget::Instance { .. }))
+            {
+                continue;
+            }
             let Some(hc) = site.health_check.as_ref() else {
                 continue;
             };
@@ -889,5 +1433,468 @@ mod tests {
                 .len(),
             16
         );
+    }
+
+    // =======================================================================
+    // C3 — ForwardBackends / InstancePool / instance health service
+    // =======================================================================
+
+    use std::net::TcpListener;
+
+    use crate::openstack::{ResolveError, Resolver};
+    use crate::state::SharedState;
+
+    fn ip4(octets: [u8; 4]) -> IpAddr {
+        IpAddr::from(octets)
+    }
+
+    /// A fake resolver — the sanctioned external-boundary stub for the injected
+    /// [`Resolver`] seam.
+    struct FakeResolver {
+        reply: Result<ResolvedInstance, ResolveError>,
+    }
+
+    #[async_trait]
+    impl Resolver for FakeResolver {
+        async fn resolve(&self, _instance: &str) -> Result<ResolvedInstance, ResolveError> {
+            self.reply.clone()
+        }
+    }
+
+    fn fake_ok(floating: Option<[u8; 4]>, fixed: Option<[u8; 4]>) -> Arc<dyn Resolver> {
+        Arc::new(FakeResolver {
+            reply: Ok(ResolvedInstance {
+                floating: floating.map(ip4),
+                fixed: fixed.map(ip4),
+            }),
+        })
+    }
+
+    fn fake_err(err: ResolveError) -> Arc<dyn Resolver> {
+        Arc::new(FakeResolver { reply: Err(err) })
+    }
+
+    fn instance_site(
+        name: &str,
+        backends: Vec<Backend>,
+        mode: LbMode,
+        health_check: Option<HealthCheck>,
+    ) -> ForwardSite {
+        let mut site = forward_site(name, backends, health_check);
+        site.openstack_env = Some("prod".to_owned());
+        site.lb_mode = mode;
+        site
+    }
+
+    fn state_for(forward: Vec<ForwardSite>) -> SharedState {
+        SharedState::try_new(config(forward)).expect("state builds")
+    }
+
+    fn pool_for(state: &SharedState, site: &str) -> Arc<InstancePool> {
+        match state.lb(site).expect("pool present").as_ref() {
+            ForwardBackends::Instance(pool) => Arc::clone(pool),
+            ForwardBackends::Static(_) => panic!("expected an instance pool"),
+        }
+    }
+
+    fn inject_resolver(state: &SharedState, env: &str, resolver: Arc<dyn Resolver>) {
+        let mut snapshot = state.snapshot().shallow();
+        let mut map = (*snapshot.resolvers).clone();
+        map.insert(env.to_owned(), resolver);
+        snapshot.resolvers = Arc::new(map);
+        state.store(snapshot);
+    }
+
+    fn listening_port() -> (TcpListener, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        (listener, port)
+    }
+
+    fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        port
+    }
+
+    fn instance_of(pick: Option<PoolPick>) -> Option<String> {
+        match pick {
+            Some(PoolPick::Instance { instance, .. }) => Some(instance),
+            _ => None,
+        }
+    }
+
+    // ----- site pool assembly -----
+
+    #[test]
+    fn addr_only_site_yields_a_static_pool() {
+        let state = state_for(vec![forward_site("www", vec![backend(1, 1)], None)]);
+        assert!(matches!(
+            state.lb("www").expect("pool").as_ref(),
+            ForwardBackends::Static(_)
+        ));
+    }
+
+    #[test]
+    fn instance_site_yields_an_instance_pool() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("INS001", 8080, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        assert!(matches!(
+            state.lb("apps").expect("pool").as_ref(),
+            ForwardBackends::Instance(_)
+        ));
+    }
+
+    #[test]
+    fn mixed_addr_and_instance_site_yields_an_instance_pool() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![backend(1, 1), instance_backend("INS001", 8080, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        assert!(matches!(
+            state.lb("apps").expect("pool").as_ref(),
+            ForwardBackends::Instance(_)
+        ));
+    }
+
+    // ----- selection: weights, round robin, weight-0, ketama -----
+
+    #[test]
+    fn instance_pool_weighted_round_robin_honours_weights() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![
+                instance_backend("alpha", 8080, 3),
+                instance_backend("beta", 8080, 1),
+            ],
+            LbMode::WeightedRoundRobin,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for _ in 0..8 {
+            if let Some(instance) = instance_of(pool.select(None)) {
+                *counts.entry(instance).or_default() += 1;
+            }
+        }
+        assert_eq!(counts.get("alpha"), Some(&6));
+        assert_eq!(counts.get("beta"), Some(&2));
+    }
+
+    #[test]
+    fn instance_pool_round_robin_alternates() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![
+                instance_backend("alpha", 8080, 1),
+                instance_backend("beta", 8080, 1),
+            ],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+        let seen: Vec<Option<String>> = (0..4).map(|_| instance_of(pool.select(None))).collect();
+        assert_eq!(
+            seen,
+            vec![
+                Some("alpha".to_owned()),
+                Some("beta".to_owned()),
+                Some("alpha".to_owned()),
+                Some("beta".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn instance_pool_excludes_weight_zero_entries() {
+        // A weight-0 instance alongside an enabled addr yields only the addr.
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![backend(7, 1), instance_backend("alpha", 8080, 0)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+        for _ in 0..4 {
+            assert_eq!(pool.select(None), Some(PoolPick::Static(addr(7))));
+        }
+    }
+
+    #[test]
+    fn instance_pool_with_no_enabled_entries_selects_none() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("alpha", 8080, 0)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+        assert_eq!(pool.select(None), None);
+    }
+
+    #[test]
+    fn ketama_index_is_keyed_on_identity_not_address() {
+        let nodes = vec![("alpha".to_owned(), 1u32), ("beta".to_owned(), 1u32)];
+        let key = Some(ip4([203, 0, 113, 7]));
+        let first = ketama_index(&nodes, key);
+        assert!(first.is_some());
+        for _ in 0..10 {
+            assert_eq!(ketama_index(&nodes, key), first, "ketama must be sticky");
+        }
+        // Both identity-keyed nodes are reachable across a spread of clients.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..1024u32 {
+            let client = Some(ip4([10, 0, (i >> 8) as u8, i as u8]));
+            if let Some(index) = ketama_index(&nodes, client) {
+                seen.insert(index);
+            }
+        }
+        assert_eq!(seen.len(), 2, "both instances must be reachable");
+    }
+
+    #[test]
+    fn instance_pool_ketama_is_stable_per_client() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![
+                instance_backend("alpha", 8080, 1),
+                instance_backend("beta", 8080, 1),
+            ],
+            LbMode::Ketama,
+            None,
+        )]);
+        let pool = pool_for(&state, "apps");
+        let client = Some(ip4([203, 0, 113, 7]));
+        let first = pool.select(client);
+        assert!(first.is_some());
+        for _ in 0..10 {
+            assert_eq!(pool.select(client), first, "ketama must be sticky per client");
+        }
+    }
+
+    // ----- health probing + resolution cache -----
+
+    #[tokio::test]
+    async fn instance_pool_probe_marks_resolved_healthy_and_caches_address() {
+        let (_listener, port) = listening_port();
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("INS001", port, 1)],
+            LbMode::RoundRobin,
+            Some(tcp_health()),
+        )]);
+        inject_resolver(&state, "prod", fake_ok(Some([127, 0, 0, 1]), None));
+        let pool = pool_for(&state, "apps");
+
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+
+        assert!(pool.select(None).is_some(), "a reachable instance stays selectable");
+        assert_eq!(
+            pool.resolved("INS001").map(|resolved| resolved.floating),
+            Some(Some(ip4([127, 0, 0, 1])))
+        );
+    }
+
+    #[tokio::test]
+    async fn instance_pool_probe_marks_unreachable_unhealthy() {
+        let port = closed_port();
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("INS001", port, 1)],
+            LbMode::RoundRobin,
+            Some(tcp_health()),
+        )]);
+        inject_resolver(&state, "prod", fake_ok(Some([127, 0, 0, 1]), None));
+        let pool = pool_for(&state, "apps");
+
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+
+        assert_eq!(pool.select(None), None, "an unreachable instance is not selectable");
+    }
+
+    #[tokio::test]
+    async fn instance_pool_resolve_failure_marks_unhealthy() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("ghost", 8080, 1)],
+            LbMode::RoundRobin,
+            Some(tcp_health()),
+        )]);
+        inject_resolver(&state, "prod", fake_err(ResolveError::NotFound));
+        let pool = pool_for(&state, "apps");
+
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+
+        assert_eq!(pool.select(None), None);
+        assert!(pool.resolved("ghost").is_none());
+    }
+
+    #[tokio::test]
+    async fn instance_pool_probes_static_entries_directly() {
+        let (_listener, up) = listening_port();
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![
+                backend(up, 1),
+                instance_backend("ghost", 8080, 1),
+            ],
+            LbMode::RoundRobin,
+            Some(tcp_health()),
+        )]);
+        inject_resolver(&state, "prod", fake_err(ResolveError::NotFound));
+        let pool = pool_for(&state, "apps");
+
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+
+        // The reachable static entry is healthy; the unresolvable instance is
+        // not, so only the static entry is selected.
+        assert_eq!(pool.select(None), Some(PoolPick::Static(addr(up))));
+    }
+
+    #[tokio::test]
+    async fn instance_pool_all_unhealthy_selects_none() {
+        let down_a = closed_port();
+        let down_b = closed_port();
+        let state = state_for(vec![instance_site(
+            "seed",
+            vec![instance_backend("seed", 8080, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let backends = [backend(down_a, 1), backend(down_b, 1)];
+        let pool = InstancePool::new("prod", &backends, &LbMode::RoundRobin, state.handle());
+
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+
+        assert_eq!(pool.select(None), None);
+    }
+
+    // ----- update: health carry-over -----
+
+    #[tokio::test]
+    async fn instance_pool_update_preserves_health_by_identity() {
+        let (_up, up) = listening_port();
+        let down = closed_port();
+        let state = state_for(vec![instance_site(
+            "seed",
+            vec![instance_backend("seed", 8080, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        let backends = [backend(up, 1), backend(down, 1)];
+        let pool = InstancePool::new("prod", &backends, &LbMode::RoundRobin, state.handle());
+
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+        assert_eq!(pool.select(None), Some(PoolPick::Static(addr(up))));
+
+        // Re-applying the same membership must keep the unhealthy entry's bit.
+        pool.update(&backends);
+        assert_eq!(
+            pool.select(None),
+            Some(PoolPick::Static(addr(up))),
+            "update must carry the observed health over by identity"
+        );
+
+        // A brand-new identity starts healthy.
+        pool.update(&[backend(up, 1), backend(7, 1)]);
+        let picks: std::collections::HashSet<Option<PoolPick>> =
+            (0..4).map(|_| pool.select(None)).collect();
+        assert!(picks.contains(&Some(PoolPick::Static(addr(7)))));
+    }
+
+    #[tokio::test]
+    async fn instance_pool_update_drops_removed_cached_resolution() {
+        let (_listener, port) = listening_port();
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("alpha", port, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        inject_resolver(&state, "prod", fake_ok(Some([127, 0, 0, 1]), None));
+        let pool = pool_for(&state, "apps");
+
+        let probe = build_probe(&tcp_health());
+        pool.probe_instances(probe.as_ref()).await;
+        assert!(pool.resolved("alpha").is_some());
+
+        pool.update(&[instance_backend("beta", port, 1)]);
+        assert!(
+            pool.resolved("alpha").is_none(),
+            "a removed instance's cached resolution must be dropped"
+        );
+        assert!(instance_of(pool.select(None)).as_deref() == Some("beta"));
+    }
+
+    // ----- instance health service -----
+
+    #[tokio::test]
+    async fn instance_health_service_skips_sites_without_health_check() {
+        let (_listener, port) = listening_port();
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("INS001", port, 1)],
+            LbMode::RoundRobin,
+            None,
+        )]);
+        // Even an unresolvable instance stays selectable: no probe loop exists.
+        inject_resolver(&state, "prod", fake_err(ResolveError::NotFound));
+        let pool = pool_for(&state, "apps");
+
+        let service = InstanceHealthService {
+            snapshot: state.handle(),
+            last: Mutex::new(HashMap::new()),
+        };
+        service.tick().await;
+
+        assert!(pool.resolved("INS001").is_none(), "no health_check must not probe");
+        assert!(pool.select(None).is_some(), "enabled entries stay selectable");
+    }
+
+    #[tokio::test]
+    async fn instance_health_service_marks_unresolvable_unhealthy() {
+        let state = state_for(vec![instance_site(
+            "apps",
+            vec![instance_backend("INS001", 8080, 1)],
+            LbMode::RoundRobin,
+            Some(tcp_health()),
+        )]);
+        inject_resolver(&state, "prod", fake_err(ResolveError::NotFound));
+        let pool = pool_for(&state, "apps");
+
+        let service = InstanceHealthService {
+            snapshot: state.handle(),
+            last: Mutex::new(HashMap::new()),
+        };
+        service.tick().await;
+
+        assert_eq!(pool.select(None), None);
+    }
+
+    #[test]
+    fn probe_registry_sync_skips_mixed_instance_sites() {
+        // A mixed site's pool is `ForwardBackends::Instance`, so the shared
+        // registry must not probe its static entry (no double probing).
+        let probes = ProbeRegistry::new();
+        probes.sync(&config(vec![instance_site(
+            "mixed",
+            vec![backend(2, 1), instance_backend("INS001", 8080, 1)],
+            LbMode::RoundRobin,
+            Some(tcp_health()),
+        )]));
+        assert_eq!(probes.slot_count(), 0);
     }
 }
