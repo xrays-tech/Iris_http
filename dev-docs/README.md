@@ -1,6 +1,6 @@
 # Iris HTTP — 技术设计文档（含实现与验证记录）
 
-Rust + Pingora 的 HTTP/HTTPS 反向代理。需求来源：`propose.md`。实现已按 TDD 分阶段完成（P0–P8），并经受一次全量 code-review（发现并修复 8 项缺陷：原子快照、共享健康注册表、证书热重载、单飞取消防护、认证超时等）；后续 P14 增加**独立 OpenStack 环境文件 + forward 后端按实例名/UUID**（见 `plan/14-forward-instance-backends.md`）。下述验证证据均为本仓库当前 HEAD（`1480aba`）实测输出。
+Rust + Pingora 的 HTTP/HTTPS 反向代理。需求来源：`propose.md`。实现已按 TDD 分阶段完成（P0–P8），并经受一次全量 code-review（发现并修复 8 项缺陷：原子快照、共享健康注册表、证书热重载、并发合并取消防护、认证超时等）；后续 P14 增加**独立 OpenStack 环境文件 + forward 后端按实例名/UUID**（见 `plan/14-forward-instance-backends.md`）。下述验证证据均为本仓库当前 HEAD（`60ca157`）实测输出。
 
 ## 设计文档
 
@@ -8,7 +8,7 @@ Rust + Pingora 的 HTTP/HTTPS 反向代理。需求来源：`propose.md`。实�
 |---|---|
 | `design.md` | 总体架构、核心组件、请求生命周期、模块结构、依赖基线、设计决策、可观测性 |
 | `config.md` | 配置体系：站点两种模式 schema、负载均衡枚举、校验、域名匹配规则、secret 展开 |
-| `discovery.md` | OpenStack 自动模式：Keystone 认证、Nova 查询、地址选择、1 天缓存、单飞/熔断/fail-open |
+| `discovery.md` | OpenStack 自动模式：Keystone 认证、Nova 查询、地址选择、1 天缓存、请求合并/熔断/fail-open |
 | `firewall.md` | 防火墙规则：`INSTANCE.role` 格式、default-deny 判定顺序、白/黑名单语义 |
 | `reload.md` | `reload` 命令热重载、生效机制、信号与优雅关闭/升级、运维联动 |
 | `ops-deploy.md` | 部署与运维：systemd unit、证书零停机轮换、配置/防火墙变更、排障 |
@@ -32,7 +32,7 @@ cargo run --bin iris -- run --config-dir <config-root>
 - 热重载：`iris reload --pidfile <pidfile>`（缺省 `/run/iris/iris.pid`）向运行进程发 SIGHUP；配置校验失败保持旧配置生效；`--watch-config` 为可选轮询监视（默认关）。
 - 关闭：SIGTERM 优雅关闭；SIGQUIT/SIGINT 由 Pingora 处理（优雅升级/快速关闭）。
 
-## 验证证据（HEAD 1480aba，2026-10-18）
+## 验证证据（HEAD 60ca157，2026-10-18）
 
 - `cargo build`：0 warnings / 0 errors。
 - `cargo test`：**360 passed / 0 failed**（lib 254、bin 7、config_load 71、firewall 11、openstack 17）。
@@ -44,7 +44,7 @@ cargo run --bin iris -- run --config-dir <config-root>
   - `scripts/e2e/09-health-reload.sh` — 重载后健康检查状态保留（引擎复用，健康后端不被误选）；
   - `scripts/e2e/10-tls-reload.sh` — reload 后新 HTTPS 站点的 SNI 证书即时生效（通配 `*.rent.do.top`）；
   - `scripts/e2e/11-health-reload-new-site.sh` — reload 新增带健康检查的站点即受探针门禁（503 后端不被选中，调参后恢复）；
-  - `scripts/e2e/12-forward-instance.sh` — forward 实例后端（P14-C3）：加权 2:1 分发、name+UUID 混用（UUID 走 show-by-id）、token/缓存/单飞、解析失败 502、TCP 健康剔除与恢复、热重载移除实例后端。
+  - `scripts/e2e/12-forward-instance.sh` — forward 实例后端（P14-C3）：加权 2:1 分发、name+UUID 混用（UUID 走 show-by-id）、token/缓存/请求合并、解析失败 502、TCP 健康剔除与恢复、热重载移除实例后端。
 - 所有生产代码（`src/`）无 `unwrap()/expect()/panic!`（测试模块除外，已多次 grep 佐证）。
 
 ## 测试/冒烟工具

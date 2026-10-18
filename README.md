@@ -9,10 +9,10 @@
 - **两种站点模式**
   - **forward**：精确域名匹配 → 后端列表（可加权）→ 负载均衡
     （`round_robin` / `weighted_round_robin` / `random` / `ketama`），支持 TCP/HTTP 健康检查，宕机后端自动剔除。
-    后端可为字面 `IP:port`（`addr`），**也可为 OpenStack 实例名或 UUID**（`instance` + 显式 `port`，站点级 `openstack_env` 引用一个环境），二者可在同一站点内混用；实例后端复用完整发现链路（解析、缓存、单飞、熔断、fail-open）。
+    后端可为字面 `IP:port`（`addr`），**也可为 OpenStack 实例名或 UUID**（`instance` + 显式 `port`，站点级 `openstack_env` 引用一个环境），二者可在同一站点内混用；实例后端复用完整发现链路（解析、缓存、熔断、fail-open；相同实例的并发请求只向上游查询一次）。
   - **openstack**：全自动发现。域名形如 `{instance}-{port}.base_domain`（如 `INS001-80.rent.do.top`），
     经 Keystone v3 认证 + Nova 2.1 全局查询实例的 floating/fixed IP，反向代理到 `IP:port`；结果缓存约 1 天，
-    带单飞并发折叠、熔断与 fail-open（last-known-good）。
+    相同实例的并发访问合并为一次上游查询；另带熔断与 fail-open（上游故障时用最近一次成功结果继续服务）。
 - **独立 OpenStack 环境**：控制面配置从站点文件独立为 `<config-dir>/openstack/<env-name>.yaml`，站点按名引用（`openstack_env`）；**每环境一个 resolver + 一份缓存**，被任意多个 openstack 站点与 forward 实例池共享。
 - **HTTPS / SNI**：共享 `0.0.0.0:443` 单监听，按 SNI 选择证书（forward 精确匹配；openstack 通配 `*.base_domain`），
   ALPN 协商 HTTP/2；证书可随热重载无停机轮换。
@@ -163,7 +163,7 @@ src/
   state.rs           # 单一原子 Snapshot（热重载一次切换）
   firewall.rs        # INSTANCE.role 解析 + default-deny 判定
   reload.rs          # apply_new_config + SIGHUP ReloadService + 指标
-  openstack/         # mod/auth/nova/cache：Keystone、Nova 2.1（名称/UUID show-by-id）、缓存/单飞/熔断/fail-open；build_env_resolvers（键=环境名）
+  openstack/         # mod/auth/nova/cache：Keystone、Nova 2.1（名称/UUID show-by-id）、缓存/请求合并/熔断/fail-open；build_env_resolvers（键=环境名）
 scripts/
   e2e/*.sh           # 8 个可复现端到端（forward/tls/openstack/reload/health-reload/tls-reload/new-site-health/forward-instance）
   mock_openstack.py  # Keystone/Nova 契约 mock
