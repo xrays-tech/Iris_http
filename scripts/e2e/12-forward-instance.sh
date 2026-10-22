@@ -297,13 +297,21 @@ fi
 echo
 echo "=== phase 2: name + UUID mixed, token reuse, cache ==="
 appA_calls="$(record_count 'name=appA')"
+# Real Nova's list endpoint omits `addresses`, so a cold name resolution costs
+# exactly 2 Nova requests: the name list (locate the id) + show-by-id (detail).
+appA_detail_calls="$(record_count '/servers/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa')"
 uuid_calls="$(record_count "/servers/$UUID")"
 auth_calls="$(record_count '/v3/auth/tokens')"
-printf '    %-54s %s\n' "Nova name lookup (name=appA)" "$appA_calls"
+printf '    %-54s %s\n' "Nova name list (name=appA)" "$appA_calls"
+printf '    %-54s %s\n' "Nova show-by-id (appA detail)" "$appA_detail_calls"
 printf '    %-54s %s\n' "Nova show-by-id (/servers/<uuid>)" "$uuid_calls"
 printf '    %-54s %s\n' "Keystone POST /v3/auth/tokens" "$auth_calls"
-if [ "$appA_calls" -lt 1 ]; then
-  echo "ASSERT FAIL: the name backend never hit the Nova name query"
+if [ "$appA_calls" != "1" ]; then
+  echo "ASSERT FAIL: expected exactly one Nova name list for appA, got $appA_calls"
+  exit 1
+fi
+if [ "$appA_detail_calls" != "1" ]; then
+  echo "ASSERT FAIL: expected exactly one show-by-id detail for appA, got $appA_detail_calls"
   exit 1
 fi
 if [ "$uuid_calls" -lt 1 ]; then
@@ -316,9 +324,11 @@ if [ "$auth_calls" != "1" ]; then
 fi
 
 # A warm resolution must be reused: many more requests add no Nova traffic.
-before=$((appA_calls + uuid_calls))
+before=$((appA_calls + appA_detail_calls + uuid_calls))
 summary "$BASE" 12 > /dev/null
-after="$(( $(record_count 'name=appA') + $(record_count "/servers/$UUID") ))"
+after="$(( $(record_count 'name=appA') \
+  + $(record_count '/servers/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa') \
+  + $(record_count "/servers/$UUID") ))"
 printf '    %-54s %s -> %s\n' "Nova lookups before/after 12 warm requests" "$before" "$after"
 if [ "$after" != "$before" ]; then
   echo "ASSERT FAIL: a warm resolution was re-fetched ($before -> $after)"

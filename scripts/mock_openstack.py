@@ -5,11 +5,16 @@ Implements the P5/P7 contract from ``dev-docs/plan/12-mock-fixtures.md``:
 
 * ``POST /v3/auth/tokens`` -> ``201`` + ``X-Subject-Token`` and a body carrying a
   Nova catalog (``type=compute``, public URL pointing at this mock's ``/v2.1``).
-* ``GET /v2.1/servers?name=<name>&all_tenants=true`` -> ``200`` JSON from
-  ``--servers-dir/<name>.json`` (``404`` when absent), or a forced status/timeout.
+* ``GET /v2.1/servers?name=<name>&all_tenants=true`` -> ``200`` with
+  address-less shells (``{"servers": [{"id", "name"}]}``) extracted from
+  ``--servers-dir/<name>.json`` (``404`` when absent), mirroring real Nova,
+  whose list endpoint does not return ``addresses``.
 * ``GET /v2.1/servers/<uuid>`` (Nova show-by-id) -> ``200`` single-server
-  envelope from ``--servers-dir/<uuid>.json`` (``404`` when absent), sharing the
-  same forced-status/timeout/401-once gates as the name query.
+  envelope from ``--servers-dir/<uuid>.json``; when no such file exists the
+  servers dir is scanned for a fixture whose in-body ``server.id`` matches the
+  requested uuid (so name-keyed fixtures still serve detail). ``404`` when no
+  match. Shares the same forced-status/timeout/401-once gates as the name
+  query; ``--servers-show-status`` can force a status on this endpoint alone.
 * Every request's ``X-Auth-Token`` / ``OpenStack-API-Version`` (and method/path)
   is appended as one JSON line to ``--record`` so tests can prove token reuse
   and assert which endpoint (name query vs show-by-id) was hit.
@@ -46,6 +51,7 @@ class Options:
         self.auth_fail: bool = args.auth_fail
         self.auth_delay: float = args.auth_delay
         self.servers_status: int | None = args.servers_status
+        self.servers_show_status: int | None = args.servers_show_status
         self.servers_unauthorized_once: bool = args.servers_unauthorized_once
         self.delay: float = args.delay
         self.nova_url: str | None = args.nova_url
@@ -183,6 +189,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _servers_of(payload):
+        """Return the server objects inside a list or single Nova envelope."""
+        if not isinstance(payload, dict):
+            return []
+        if isinstance(payload.get("servers"), list):
+            return [server for server in payload["servers"] if isinstance(server, dict)]
+        if isinstance(payload.get("server"), dict):
+            return [payload["server"]]
+        return []
+
+    def _load_json(self, path: str):
+        try:
+            with open(path, "rb") as handle:
+                return json.load(handle)
+        except (OSError, ValueError):
+            return None
+
     def _handle_servers(self, parsed) -> None:
         if self._nova_gate():
             return
@@ -196,19 +220,41 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isfile(fixture):
             self._error(404, "instance not found")
             return
-        self._send_fixture(fixture)
+
+        # Real Nova's list endpoint omits `addresses` (even for admin); return
+        # only the identity shells so clients must use show-by-id for detail.
+        payload = self._load_json(fixture)
+        shells = [
+            {"id": server.get("id"), "name": server.get("name")}
+            for server in self._servers_of(payload)
+        ]
+        self._send_json(200, {"servers": shells})
 
     def _handle_server_show(self, server_id: str) -> None:
         if self._nova_gate():
+            return
+        if _OPTIONS.servers_show_status is not None:
+            self._error(_OPTIONS.servers_show_status, "forced show status")
             return
         if not _OPTIONS.servers_dir:
             self._error(404, "instance not found")
             return
         fixture = os.path.join(_OPTIONS.servers_dir, f"{server_id}.json")
-        if not os.path.isfile(fixture):
-            self._error(404, "instance not found")
+        if os.path.isfile(fixture):
+            self._send_fixture(fixture)
             return
-        self._send_fixture(fixture)
+
+        # No `<uuid>.json` file: scan the fixtures and serve the full detail of
+        # the server whose in-body id matches (name-keyed fixtures stay usable).
+        for entry in sorted(os.listdir(_OPTIONS.servers_dir)):
+            if not entry.endswith(".json"):
+                continue
+            payload = self._load_json(os.path.join(_OPTIONS.servers_dir, entry))
+            for server in self._servers_of(payload):
+                if server.get("id") == server_id:
+                    self._send_json(200, {"server": server})
+                    return
+        self._error(404, "instance not found")
 
 
 def _parse_args(argv) -> argparse.Namespace:
@@ -226,6 +272,12 @@ def _parse_args(argv) -> argparse.Namespace:
         help="accept then sleep before replying to /v3/auth/tokens (timeout test)",
     )
     parser.add_argument("--servers-status", type=int, default=None, help="force a status for /servers")
+    parser.add_argument(
+        "--servers-show-status",
+        type=int,
+        default=None,
+        help="force a status for /servers/<uuid> (show-by-id) only",
+    )
     parser.add_argument(
         "--servers-unauthorized-once",
         action="store_true",

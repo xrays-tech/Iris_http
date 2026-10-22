@@ -195,12 +195,17 @@ impl OpenStackFetcher {
 
     /// Look `instance` up on Nova. UUID-shaped input goes to show-by-id
     /// (`GET /servers/{uuid}`); anything else is an exact-name list query.
+    ///
+    /// A name lookup is two calls: the list endpoint only *locates* the
+    /// instance (real Nova omits `addresses` from list responses), then
+    /// show-by-id fetches the detail whose `addresses` the caller selects from.
     async fn query(&self, instance: &str, token: &Token) -> Result<NovaServer, NovaError> {
+        let base = self.base(token);
         if is_instance_uuid(instance) {
             query_server_by_id(
                 &self.client,
                 &token.value,
-                &self.base(token),
+                &base,
                 instance,
                 self.timeout,
             )
@@ -209,15 +214,19 @@ impl OpenStackFetcher {
             let servers = query_servers(
                 &self.client,
                 &token.value,
-                &self.base(token),
+                &base,
                 instance,
                 self.all_tenants,
                 self.timeout,
             )
             .await?;
-            exact_name_match(instance, &servers)
-                .cloned()
-                .ok_or(NovaError::NotFound)
+            let id = exact_name_match(instance, &servers)
+                .ok_or(NovaError::NotFound)?
+                .id
+                .clone();
+            // The list response carries no usable addresses on a real cloud,
+            // so resolve the matched id through show-by-id (`discovery.md` §4).
+            query_server_by_id(&self.client, &token.value, &base, &id, self.timeout).await
         }
     }
 }

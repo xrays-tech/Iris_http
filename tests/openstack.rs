@@ -381,13 +381,74 @@ async fn name_path_still_queries_by_name() {
     let resolved = resolver.resolve("multi-nic").await.expect("name resolves");
     assert_eq!(resolved.floating, Some(ip("203.0.113.10")));
 
+    // A name resolution is two Nova calls: list (locate the id) + show-by-id
+    // (real Nova list responses carry no `addresses`).
     let gets = nova_server_gets(&record);
-    assert_eq!(gets.len(), 1);
+    assert_eq!(gets.len(), 2, "a name resolution costs exactly one list + one detail");
     assert_eq!(
         gets[0]["path"], "/v2.1/servers",
-        "a name must keep hitting the list endpoint"
+        "a name must first hit the list endpoint"
     );
     assert_eq!(gets[0]["query"], "name=multi-nic&all_tenants=true");
+    assert_eq!(
+        gets[1]["path"], "/v2.1/servers/11111111-1111-1111-1111-111111111111",
+        "the matched id must be resolved through show-by-id"
+    );
+    assert_eq!(gets[1]["query"], "", "show-by-id sends no query string");
+}
+
+#[tokio::test]
+async fn name_resolution_detail_404_is_not_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = dir.path().join("lone.json");
+    std::fs::write(
+        &fixture,
+        br#"{"servers":[{"id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","name":"lone",
+             "addresses":{"net":[{"version":4,"addr":"10.0.0.1","OS-EXT-IPS:type":"fixed"}]}}]}"#,
+    )
+    .expect("write fixture");
+    let servers_dir = dir.path().to_str().expect("utf-8 dir").to_owned();
+
+    let (_guard, record) = record_file();
+    let mock = Mock::start(&[
+        "--record".to_owned(),
+        record.to_owned(),
+        "--servers-dir".to_owned(),
+        servers_dir,
+        "--servers-show-status".to_owned(),
+        "404".to_owned(),
+    ]);
+    let resolver = resolver_for(mock.port, 60, 5);
+
+    assert_eq!(
+        resolver.resolve("lone").await.unwrap_err(),
+        ResolveError::NotFound,
+        "a list shell whose show-by-id detail is missing must be NotFound"
+    );
+
+    let gets = nova_server_gets(&record);
+    assert_eq!(gets.len(), 2, "list then detail are both attempted");
+    assert_eq!(gets[1]["path"], "/v2.1/servers/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+}
+
+#[tokio::test]
+async fn name_resolution_detail_without_addresses_is_no_address() {
+    let (_guard, record) = record_file();
+    let mock = mock_with_record(&record, &[]);
+    let resolver = resolver_for(mock.port, 60, 5);
+
+    assert_eq!(
+        resolver.resolve("empty-addresses").await.unwrap_err(),
+        ResolveError::NoAddress,
+        "the list shell exists but the fetched detail has no usable address"
+    );
+
+    let gets = nova_server_gets(&record);
+    assert_eq!(gets.len(), 2);
+    assert_eq!(gets[0]["path"], "/v2.1/servers");
+    assert_eq!(
+        gets[1]["path"], "/v2.1/servers/66666666-6666-6666-6666-666666666666"
+    );
 }
 
 #[tokio::test]
@@ -404,10 +465,11 @@ async fn uuid_and_name_mixed_resolution_shares_one_token() {
     assert_eq!(by_name.floating, Some(ip("203.0.113.11")));
 
     let gets = nova_server_gets(&record);
-    assert_eq!(gets.len(), 2);
+    assert_eq!(gets.len(), 3, "uuid show-by-id + name list + name detail");
     let paths: Vec<&str> = gets.iter().map(|g| g["path"].as_str().unwrap()).collect();
     assert!(paths.contains(&format!("/v2.1/servers/{UUID_FIXED}").as_str()));
     assert!(paths.contains(&"/v2.1/servers"));
+    assert!(paths.contains(&"/v2.1/servers/22222222-2222-2222-2222-222222222222"));
     assert_eq!(
         auth_calls(&record),
         1,
@@ -459,8 +521,9 @@ async fn env_keyed_resolvers_share_one_cache_per_env() {
     assert_eq!(first, second);
     assert_eq!(
         nova_server_gets(&record).len(),
-        1,
-        "sharing one resolver per env means the second resolve is a cache hit"
+        2,
+        "sharing one resolver per env means the second resolve is a cache hit; \
+         the cold name resolution itself is list + show-by-id"
     );
 }
 

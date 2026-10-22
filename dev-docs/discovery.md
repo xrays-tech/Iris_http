@@ -32,7 +32,7 @@ resolve(instance_name):
        │ close/half-open
        ▼
   4. 认证：有效 cache token？否 → POST /v3/auth/tokens（§3）
-  5. Nova 查询（§4）：known uuid 直查 / 否则 name 列表查询 + 精确匹配
+  5. Nova 查询（§4）：known uuid 直查 / 否则 name 列表定位 + show-by-id 取详情
   6. 地址选择（§5）：floating 优先 → fixed 回退
   7. 更新缓存与 last-known-good（§6）
 ```
@@ -62,12 +62,13 @@ resolve(instance_name):
 | 场景 | 方法/路径 | 查询参数 | 判定 |
 |---|---|---|---|
 | 按 UUID（identifier 形如 `8-4-4-4-12`） | `GET /servers/{uuid}` | — | 200 → 单实例信封 `{"server":{...}}`；404 → 不存在 |
-| 按名称（其余情况） | `GET /servers` | `name={instance_name}&all_tenants=true` | 200 → 列表内做**精确名称匹配**（`exact_name_match`，name 字段逐字节相等） |
+| 按名称（其余情况） | `GET /servers` 然后 `GET /servers/{id}` | list: `name={instance_name}&all_tenants=true`；detail: — | 200 → 列表内**精确名称匹配**（`exact_name_match`）定位 id，再对 id 走 show-by-id 取 **详情信封** 用于地址选择 |
 
 **UUID 优先级规则（重要）**：只要 identifier 是 `8-4-4-4-12` 十六进制字符串（大小写不敏感，长度与分隔符严格），就**一律**走 `GET /servers/{uuid}` show-by-id——`is_instance_uuid` 在 `query` 分发前判别。
 
 - 推论：一个**真实名称为 UUID 形态**的实例**无法按名称解析**；同一标识总被当作 UUID。这是刻意的确定性规则，避免"同名 UUID 字符串"歧义。
-- 名称路径的具体过程：`query_servers` 取回列表 → `exact_name_match` 逐字节相等；列表为空或名字不等价于 404（实例不存在）→ 负缓存。
+- 名称路径的具体过程（**两次 Nova 调用**）：`query_servers` 取回列表 → `exact_name_match` 逐字节相等定位实例 id（列表为空或无精确匹配 → 404，负缓存）→ 对该 id 调 `query_server_by_id` 取详情，用详情中的 `addresses` 做地址选择。**真实 Nova 的列表端点不返回 `addresses`（字段为 null，admin 亦然）**，因此不能直接在列表结果上选地址。两次调用同属一次 `fetch`，对 `resolve(instance)` 仍是一次单飞/一次缓存条目（冷路径 2 次 Nova 调用，热路径 0 次）。
+- 列表定位成功但详情 404 → 404（实例已不存在）；详情 403/5xx/超时/解码失败 → 502（瞬时错误，§7）；详情无地址 → 502（`NoAddress`）。
 - 两条路径复用同一套标准头、状态映射（401/403/404/其它非 2xx）与 401 单次刷新重试。
 - 必需头：`X-Auth-Token: {token}`、`Accept: application/json`、`OpenStack-API-Version: compute 2.1`（与 Iris_ssh mock 契约一致）。
 - `all_tenants=true` 配合 admin/有权限的认证主体，实现"全局查找实例"（propose 要求）。若认证主体无跨项目权限，Nova 可能返回 403 → 记录清晰错误事件，按"发现服务错误"处理（§7）。show-by-id 路径不带 `all_tenants`。
@@ -141,7 +142,7 @@ Nova 响应结构（`server.addresses`）：
 
 | 场景 | 客户端状态 | 说明 |
 |---|---|---|
-| 实例不存在 / 名称无精确匹配 | 404 | 负缓存；语义为"无此路由目标" |
+| 实例不存在 / 名称无精确匹配 / 列表命中但 show-by-id 详情 404 | 404 | 负缓存；语义为"无此路由目标" |
 | Nova 401 且刷新后仍失败 | 502 | 发现服务错误，日志含 auth 上下文（不打码的字段如 auth_url） |
 | 实例存在但无任何可用地址 | 502 | 无 floating 且无 fixed |
 | 熔断 open 且无 last-known-good | 502 | 带 `Retry-After` 提示（可选） |
@@ -151,7 +152,7 @@ Nova 响应结构（`server.addresses`）：
 ## 8. 性能与时序
 
 - 每请求成本：路由（精确哈希）→ ACL（O(#cidr)）→ 缓存查找（moka `O(1)`）→ 命中即完成，无任何网络开销。
-- 冷路径成本：单飞 + Nova 一次查询（超时上限 `timeout_secs`），期间同实例并发请求**等待同一结果**而不是各自超时。
+- 冷路径成本：单飞 + Nova 查询（按名称 = list 定位 + show-by-id 详情两次调用，按 UUID = 一次 show-by-id；均受 `timeout_secs` 上限约束），期间同实例并发请求**等待同一结果**而不是各自超时。
 - 建议上游连接复用 Pingora 连接池（`HttpPeer` 默认行为），同一 `{ip}:{port}` 高频复用 TLS/HTTP 连接。
 
 ## 9. 测试策略
