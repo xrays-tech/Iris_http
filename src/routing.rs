@@ -167,19 +167,26 @@ impl RoutingTable {
 
 /// Normalise a request `Host` header / TLS SNI value (`config.md` §8).
 ///
-/// Steps, in order (chosen so that a default port *and* a trailing dot are both
+/// Steps, in order (chosen so that a port *and* a trailing dot are both
 /// stripped, e.g. `Example.COM.:443` -> `example.com`):
 /// 1. ASCII-lowercase.
-/// 2. Strip a default port `:80` or `:443` (non-default ports are kept).
+/// 2. Strip a `:<port>` suffix whenever the port is a legal port
+///    (`1..=65535`) — not just the defaults. A browser may reach the proxy on
+///    any port (`http://…:8080`, `https://…:40443`, …) and the routing keys
+///    here never carry one; the OpenStack upstream port comes from the
+///    `{instance}-{port}` host prefix instead. A non-numeric, empty, zero, or
+///    overflowing suffix is not a port and is kept.
 /// 3. Strip a single trailing `.`.
 ///
 /// Empty input (or input that normalises to nothing) yields an empty string.
 pub fn normalize_host(host: &str) -> String {
     let mut h = host.to_ascii_lowercase();
-    if h.ends_with(":80") {
-        h.truncate(h.len() - 3);
-    } else if h.ends_with(":443") {
-        h.truncate(h.len() - 4);
+    if let Some(pos) = h.rfind(':') {
+        if let Ok(port) = h[pos + 1..].parse::<u16>() {
+            if port != 0 {
+                h.truncate(pos);
+            }
+        }
     }
     if h.ends_with('.') {
         h.pop();
@@ -323,15 +330,41 @@ mod tests {
     }
 
     #[test]
-    fn normalize_host_strips_default_ports_only() {
+    fn normalize_host_strips_any_legal_port() {
+        // Any legal port — not just the defaults — is stripped so a browser can
+        // reach the proxy on a non-default port (`:8080`, `:40443`, ...) and
+        // still hit its site.
         assert_eq!(normalize_host("example.com:80"), "example.com");
         assert_eq!(normalize_host("example.com:443"), "example.com");
-        assert_eq!(normalize_host("example.com:8080"), "example.com:8080");
-        assert_eq!(normalize_host("example.com:8443"), "example.com:8443");
-        assert_eq!(normalize_host("example.com:8000"), "example.com:8000");
-        // A label that merely ends in the digits `80`/`443` is untouched.
-        assert_eq!(normalize_host("example.com:180"), "example.com:180");
-        assert_eq!(normalize_host("example.com:1443"), "example.com:1443");
+        assert_eq!(normalize_host("example.com:8080"), "example.com");
+        assert_eq!(normalize_host("example.com:8443"), "example.com");
+        assert_eq!(normalize_host("example.com:8000"), "example.com");
+        assert_eq!(normalize_host("example.com:180"), "example.com");
+        assert_eq!(normalize_host("example.com:1443"), "example.com");
+    }
+
+    #[test]
+    fn normalize_host_strips_port_off_openstack_route_host() {
+        // The real upstream port lives in the `{instance}-{port}` prefix; the
+        // `:port` the browser used is only how it reached the proxy.
+        assert_eq!(
+            normalize_host("vm-v-80.apps-z1.iris.lab:8080"),
+            "vm-v-80.apps-z1.iris.lab"
+        );
+        assert_eq!(
+            normalize_host("vm-v-80.apps-z1.iris.lab:40443"),
+            "vm-v-80.apps-z1.iris.lab"
+        );
+    }
+
+    #[test]
+    fn normalize_host_keeps_illegal_port_suffixes() {
+        // A suffix that is not a legal port (`0`, overflow, non-numeric, empty)
+        // is not a port and is left untouched.
+        assert_eq!(normalize_host("example.com:abc"), "example.com:abc");
+        assert_eq!(normalize_host("example.com:0"), "example.com:0");
+        assert_eq!(normalize_host("example.com:65536"), "example.com:65536");
+        assert_eq!(normalize_host("example.com:"), "example.com:");
     }
 
     #[test]
